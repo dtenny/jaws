@@ -3,6 +3,7 @@
   (:use [clojure.java.io])
   (:use [clojure.pprint :only [cl-format]])
   (:use [clojure.tools.logging :exclude [trace]])
+  (:use clojure.set)
   (:require [amazonica.aws.ec2 :as ec2])
   (:require [amazonica.aws.identitymanagement :as iam])
   (:use [amazonica.core :only [defcredential with-credential]])
@@ -123,10 +124,14 @@
         (reset! cred-key key))
     (throw (Exception. (str "Invalid cred-map key: " key)))))
   
+(defn choose-creds
+  "Interactive selectiobn and activataion of credentials for future AWS interaction."
+  []
+  (defcred (prompt-for-credentials))
+  (println "Current creds:" (current-cred-map-entry)))
+
 (if-not @cred-key
-  (do 
-    (defcred (prompt-for-credentials))
-    (println "Current creds:" (current-cred-map-entry))))
+  (choose-creds))
 
 (defn update-cred
   "Given a key value pair as would be present in 'cred-map',
@@ -140,6 +145,11 @@
         (when (= credkey @cred-key)
           (println "Using new AWS credentials")
           (apply defcredential (take 2 credvalue))))))
+
+
+;;;
+;;; EC2 instance queries
+;;;
 
 ;; Would really like a tool that analizes unique map keys maybe types
 ;; for nested map/seq hierarchies.  To help me know what to know what keys are available
@@ -161,6 +171,49 @@
        flatten
        (map #(select-keys % [:instance-id :instance-type :public-ip-address])))
   )
+
+(defn print-instance-maps
+  "Print a sequence of maps containing per-instance data in some human friendly way.  Returns nil."
+  [s]
+  ;; Get all keys in maps, assign priorities to the order in which some keys are presented
+  ;; print keys of maps in order with formatted field widths
+  (let [all-keys (into #{} (flatten (map keys s)))
+        ordered-keys [:instance-id :image-id :vpc-id :public-dns-name :state]
+        ordered-keys-set (into #{} ordered-keys)
+        ordered-keys (into ordered-keys (clojure.set/difference all-keys ordered-keys-set))
+        min-field-widths (mapv #(count (str %)) ordered-keys)
+        ordered-value-lists (map (fn [m] (map (fn [k] (k m)) ordered-keys)) s)
+        ordered-value-length-lists (map (fn [l] (map (fn [v] (count (str v))) l)) ordered-value-lists)
+        max-field-widths (reduce (fn [vals1 vals2] (map max vals1 vals2))
+                                 min-field-widths ordered-value-length-lists)
+        n-fields (count ordered-keys)]
+    ;;(println "ordered-value-lists(1):" (first ordered-value-lists))
+    ;;(println "ordered-value-length-lists(1):" (first ordered-value-length-lists))
+    ;;(println "max-field-widths:" max-field-widths)
+    (doseq [[w k] (for [x (range n-fields)] [(nth max-field-widths x) (nth ordered-keys x)])]
+      (clojure.pprint/cl-format true "~vs " w k))
+    (println)
+    (doseq [l ordered-value-lists]
+      (doseq [[w v] (for [x (range n-fields)] [(nth max-field-widths x) (nth l x)])]
+        (clojure.pprint/cl-format true "~va " w v))
+      (println))
+    nil))
+
+(defn list-instances
+  "Print instance information to terminal, return sequence of maps, one per instnace, with select
+   attribute keys."
+  []
+  (let [instance-maps 
+        (->> (ec2/describe-instances)
+             :reservations
+             (map :instances)
+             flatten
+             (map #(select-keys % [:instance-id :vpc-id :image-id :instance-type
+                                   :public-dns-name :tags :state]))
+             (map #(merge % {:state (get-in % [:state :name])}))
+             )]
+    (print-instance-maps instance-maps)
+    instance-maps))
 
 ;;;
 ;;; IAM
