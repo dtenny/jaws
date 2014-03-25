@@ -72,9 +72,15 @@
   Return the (validated) keyword."
   []
   (println "The following credential files are known:")
-  (doseq [entry (seq @cred-map)]
-    (cl-format true "  ~s~,20tmaps to ~a~%"
-               (key entry) (str (third (val entry)))))
+  (let [cred-seq (seq @cred-map)
+        max-key-length (reduce max (map (fn [e] (count (str (key e)))) cred-seq))]
+    (doseq [entry cred-seq]
+      (let [[access-key secret-key cred-file-path] (val entry)]
+        (cl-format true "  ~vs  (~12a)  maps to ~a~%"
+                   max-key-length
+                   (key entry)
+                   (get-user-account-number access-key secret-key)
+                   (str cred-file-path)))))
   (loop [answer (read-string
                  (prompt "Which credentials would you like to use? (specify keyword)"))]
     (if-let [creds (answer @cred-map)]
@@ -321,8 +327,15 @@
 
 (defn get-user-name "Get the user-name of an iam user" []
   (get-in (iam/get-user) [:user :user-name]))
-(defn get-user-account-number "Get the AWS account number of an iam user (as a string)" []
-  (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
+
+(defn get-user-account-number
+  "Get the AWS account number of an iam user (as a string)"
+  ([] (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
+  ([accesskey secret]
+     (try
+       (with-credential [accesskey secret]
+         (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
+          (catch Exception x "<unknown>"))))
 
 (defn make-credentials
   "Create a new set of IAM credentials, 
