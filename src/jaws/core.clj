@@ -172,6 +172,7 @@
        (map #(select-keys % [:instance-id :instance-type :public-ip-address])))
   )
 
+;; *FINISH*: Maybe Move this into jdt/core, it is generic
 (defn print-maps
   "Given a sequence of maps 's', print the content of each map formatted such that the set of unique
    map keys is printed as a header line, and each map's values are printed as one line of data
@@ -213,18 +214,78 @@
       (println))
     nil))
 
+;; *FINISH*: Maybe Move this into jdt/core, it is generic and not used here.
+(defn sort-map-entries-with-preferred-key-order
+  "Sort a sequence of map entries lexicographically by key name unless there is a supplied
+   collection of keys, in which case the order of keys in the collection will be used as the sort
+   order for any keys in map entries.  Keys in map entries without keys in the sort key collection
+   will sort lexicographically after the preferred keys.
+
+   Example (sort-map-entries-with-preferred-key-order (seq {:b 1 :c 2 :a 3 :d 4}) [:d :c])
+           => ([:d 4] [:c 2] [:a 3] [:b 1])
+
+   Note that all keys in the map entries must be of the same type, e.g. keywords.
+   Mixed type keys will cause clojure.core/compare to throw an exception.
+   TBD: Whether to implicitly turn all entries to strings to avoid this problem."
+
+  [entries keys]
+  (print entries)
+  (let [keysmap (if keys
+                  (into {} (for [x (range (count keys))] [(nth keys x) x])))
+        comp (if keys
+               (fn [o1 o2]
+                 (let [p1 (get keysmap (key o1))
+                       p2 (get keysmap (key o2))
+                       o1 (or (and p1 [p1 (val o1)]) o1)
+                       o2 (or (and p2 [p2 (val o2)]) o2)]
+                   ;; Note that clojure.core/compare won't compare a number and a keyword...
+                   ;; i.e. (compare 1 :a) fails with exception
+                   (compare (str o1) (str o2))))
+               ;; If we get failures in compare, may need to map all entries to strings
+               ;; before we compare them. 
+               compare)]
+    (sort comp entries)))
+
+(defn sort-aws-tag-maps
+  "Given a sequence of maps of the form ({:key x :value y} ...)
+   Sort the maps by lexicographic :key value name unless there is a supplied
+   collection of key strings, in which case the order of keys in the collection
+   will be used as the sort order for any keys in map entries.
+   :key values in maps without matching keys in the sort key collection
+   will bt sorted lexicographically.
+
+   This is very specific to amazonica generating a bunch of
+   dual-key maps whose keys are :key and :value, this is not a generic function.
+
+   Example (sort-aws-tag-maps ({:key foo :value bar} {:key Name :value fred}) [\"Name\"])
+           => ({:key Name :value fred} {:key foo :value bar}) ; normally the map with :key 'foo' would come first"
+  [maps keys]
+  (let [keysmap (if keys
+                  (into {} (for [x (range (count keys))] [(nth keys x) x]))
+                  {})
+        comp (fn [m1 m2]
+               (let [p1 (get keysmap (:key m1)) ;'p' for priority
+                     p2 (get keysmap (:key m2))]
+                 (cond (and p1 p2) (compare [p1 (:value m1)] [p2 (:value m1)])
+                       p1 -1               ;prioritied key sorts < nonprioritied key
+                       p2 1                ;nonprioritied key is > prioritied key
+                       ;; Neither map has a priority key
+                       :else (compare [(:key m1) (:value m1)]
+                                      [(:key m2) (:value m2)]))))]
+    (sort comp maps)))
+
 (defn- squish-tag-list
   "When you retrieve the value for the :tags key in AWS data, you get a sequence
    of maps each with one key and value, where the key is the tag name and the value is the
    tag value.  E.g. [{:value this is a tag description, :key Name} ...]
 
-   Take all those sequence maps and compress them into a single vector of strings
+   Take all those maps and compress them into a single vector of strings
    of the form 'key=val' for each tag key and tag value in the maps in the seqence.
 
    E.g. [Name=this is a tag description, ...]"
-  [tag-list]
-  ;; *TODO* While we're at it, sort such that the Name and aws:autoscaling:groupName tag keys come first.
-  (mapv (fn [e] (str (:key e) "='" (:value e) "'")) (seq tag-list)))
+  [map-seq]
+  (mapv (fn [m] (str (:key m) "='" (:value m) "'"))
+        (sort-aws-tag-maps map-seq ["Name" "aws:autoscaling:groupName"])))
 
 (defn list-instances
   "Print EC2 instance information to terminal with select attribute keys.
