@@ -172,13 +172,24 @@
        (map #(select-keys % [:instance-id :instance-type :public-ip-address])))
   )
 
-(defn print-instance-maps
-  "Print a sequence of maps containing per-instance data in some human friendly way.  Returns nil."
-  [s]
+(defn print-maps
+  "Given a sequence of maps 's', print the content of each map formatted such that the set of unique
+   map keys is printed as a header line, and each map's values are printed as one line of data
+   (so one map per line). Header keywords and values are all formatted for uniform column width.
+
+   'ordered-keys' is a possibly empty collection of keywords found in the maps that are to be printed
+   in the specified order as the first columns of each line.  Any keywords encountered in the maps that is
+   not present in ordered-keys will be printed after the values for keywords in ordered-keys.
+
+   There's nothing lazy about the inner workings of this function, we grovel over all data in the sequence
+   and make a couple of intermediate trees of data, so plan accordingly.
+
+   Returns nil."
+  [s ordered-keys]
+  {:pre [(seqable? s) (coll? ordered-keys)]}
   ;; Get all keys in maps, assign priorities to the order in which some keys are presented
   ;; print keys of maps in order with formatted field widths
   (let [all-keys (into #{} (flatten (map keys s)))
-        ordered-keys [:instance-id :image-id :vpc-id :public-dns-name :state]
         ordered-keys-set (into #{} ordered-keys)
         ordered-keys (into ordered-keys (clojure.set/difference all-keys ordered-keys-set))
         min-field-widths (mapv #(count (str %)) ordered-keys)
@@ -186,34 +197,49 @@
         ordered-value-length-lists (map (fn [l] (map (fn [v] (count (str v))) l)) ordered-value-lists)
         max-field-widths (reduce (fn [vals1 vals2] (map max vals1 vals2))
                                  min-field-widths ordered-value-length-lists)
-        n-fields (count ordered-keys)]
-    ;;(println "ordered-value-lists(1):" (first ordered-value-lists))
-    ;;(println "ordered-value-length-lists(1):" (first ordered-value-length-lists))
-    ;;(println "max-field-widths:" max-field-widths)
-    (doseq [[w k] (for [x (range n-fields)] [(nth max-field-widths x) (nth ordered-keys x)])]
-      (clojure.pprint/cl-format true "~vs " w k))
+        n-fields (count ordered-keys)
+
+        ;; Presently we don't pad the last field, so that short fields won't cause long wrapping lines in terminal
+        last-width-fn (fn [field-number]
+                        (if (= field-number (- n-fields 1))
+                          (nth min-field-widths (- n-fields 1))
+                          (nth max-field-widths field-number)))]
+    (doseq [[w k] (for [x (range n-fields)] [(last-width-fn x) (nth ordered-keys x)])]
+      (cl-format true "~vs " w k))
     (println)
     (doseq [l ordered-value-lists]
-      (doseq [[w v] (for [x (range n-fields)] [(nth max-field-widths x) (nth l x)])]
-        (clojure.pprint/cl-format true "~va " w v))
+      (doseq [[w v] (for [x (range n-fields)] [(last-width-fn x) (nth l x)])]
+        (cl-format true "~va " w v))
       (println))
     nil))
 
+(defn- squish-tag-list
+  "When you retrieve the value for the :tags key in AWS data, you get a sequence
+   of maps each with one key and value, where the key is the tag name and the value is the
+   tag value.  E.g. [{:value this is a tag description, :key Name} ...]
+
+   Take all those sequence maps and compress them into a single vector of strings
+   of the form 'key=val' for each tag key and tag value in the maps in the seqence.
+
+   E.g. [Name=this is a tag description, ...]"
+  [tag-list]
+  ;; *TODO* While we're at it, sort such that the Name and aws:autoscaling:groupName tag keys come first.
+  (mapv (fn [e] (str (:key e) "='" (:value e) "'")) (seq tag-list)))
+
 (defn list-instances
-  "Print instance information to terminal, return sequence of maps, one per instnace, with select
-   attribute keys."
-  []
-  (let [instance-maps 
-        (->> (ec2/describe-instances)
-             :reservations
-             (map :instances)
-             flatten
-             (map #(select-keys % [:instance-id :vpc-id :image-id :instance-type
-                                   :public-dns-name :tags :state]))
-             (map #(merge % {:state (get-in % [:state :name])}))
-             )]
-    (print-instance-maps instance-maps)
-    instance-maps))
+  "Print EC2 instance information to terminal with select attribute keys.
+   If 'data' is specified, use that instead of calling (ec2/describe-instances).
+   Returns nil."
+  [& {:keys [data]}]
+  (let [keys [:instance-id :image-id :vpc-id :public-dns-name :state :instance-type :tags]]
+    (print-maps (->> (or data (ec2/describe-instances))
+                     :reservations
+                     (map :instances)
+                     flatten
+                     (map #(select-keys % keys))
+                     (map #(merge % {:state (get-in % [:state :name]) :tags (squish-tag-list (:tags %))})))
+                keys)))
+
 
 ;;;
 ;;; IAM
