@@ -67,6 +67,17 @@
   [access-key]
   (first (filter #(= (cred-map-entry-access-key %) access-key) @cred-map)))
 
+;; This would normally be in the IAM section, but as it's loaded when the module
+;; is loaded to prompt for credentials, I've moved the definition ahead of use.
+(defn get-user-account-number
+  "Get the AWS account number of an iam user (as a string)"
+  ([] (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
+  ([accesskey secret]
+     (try
+       (with-credential [accesskey secret]
+         (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
+          (catch Exception x "<unknown>"))))
+
 (defn prompt-for-credentials
   "Prompt user for keyword into cred-map for credential set to use.
   Return the (validated) keyword."
@@ -307,6 +318,16 @@
                      (map #(merge % {:state (get-in % [:state :name]) :tags (squish-tag-list (:tags %))})))
                 keys)))
 
+
+;; (with-output ["/tmp/foo"] (print (ec2/describe-images :filters [{:owner-id "966829157592"}]))) (:owner-id "self") ?
+;;user> (time (def images (ec2/describe-images :filters [{:owner-id "966829157592"}])))
+;;"Elapsed time: 194558.469299 msecs"
+;;#'user/images
+;; PROBLEM!!!!
+
+;; ALSO: how to change endpoint without respecifying access and secret keys?
+;; I'm happy with those, I only want to vary the region by command
+
 
 ;;;
 ;;; IAM
@@ -327,15 +348,6 @@
 
 (defn get-user-name "Get the user-name of an iam user" []
   (get-in (iam/get-user) [:user :user-name]))
-
-(defn get-user-account-number
-  "Get the AWS account number of an iam user (as a string)"
-  ([] (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
-  ([accesskey secret]
-     (try
-       (with-credential [accesskey secret]
-         (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
-          (catch Exception x "<unknown>"))))
 
 (defn make-credentials
   "Create a new set of IAM credentials, 
