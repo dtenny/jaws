@@ -1,13 +1,15 @@
 (ns jaws.native
+  (:use clojure.repl)
+  (:use clojure.set)
   (:use [jdt core cl shell easyfs])
   (:use [clojure.java.io])
   (:use [clojure.pprint :only [cl-format]])
   (:use [clojure.tools.logging :exclude [trace]])
-  (:use clojure.set)
   (:import [com.amazonaws.auth BasicAWSCredentials])
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
-  (:import [com.amazonaws.services.ec2.model DescribeImagesRequest])
+  (:import [com.amazonaws.services.ec2.model
+            DescribeImagesRequest DescribeInstancesRequest DescribeSecurityGroupsRequest Filter])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import java.io.File))
 
@@ -59,17 +61,14 @@
   [access-key]
   (first (filter #(= (cred-map-entry-access-key %) access-key) @cred-map)))
 
-;; This would normally be in the IAM section, but as it's loaded when the module
-;; is loaded to prompt for credentials, I've moved the definition ahead of use.
-#_
-(defn get-user-account-number
+;; Need a version of this in advance of IAM definitions below, for the prompt process
+(defn get-user-account-number-for-prompt
   "Get the AWS account number of an iam user (as a string)"
-  ([] (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
   ([accesskey secret]
      (try
-       (with-credential [accesskey secret]
-         (second (re-find #".*::(\d+):" (get-in (iam/get-user) [:user :arn]))))
-          (catch Exception x "<unknown>"))))
+       (let [iam (AmazonIdentityManagementClient. (BasicAWSCredentials. accesskey secret))]
+         (second (re-find #".*::(\d+):" (.getArn (.getUser (.getUser iam))))))
+       (catch Exception x "<unknown>"))))
 
 (defn prompt-for-credentials
   "Prompt user for keyword into cred-map for credential set to use.
@@ -83,8 +82,7 @@
         (cl-format true "  ~vs  (~12a)  maps to ~a~%"
                    max-key-length
                    (key entry)
-                   #_
-                   (get-user-account-number access-key secret-key) nil
+                   (get-user-account-number-for-prompt access-key secret-key)
                    (str cred-file-path)))))
   (loop [answer (read-string
                  (prompt "Which credentials would you like to use? (specify keyword)"))]
@@ -155,6 +153,16 @@
 
 (def ^:dynamic *region* (Region/getRegion Regions/US_EAST_1))
 
+
+
+;;; Stupid reporting aids
+(def- ^:dynamic *indent* "Number of spaces to indent each line printed" 0)
+
+(defn- indent "Print n spaces *out*"
+  ([] (indent *indent*))
+  ([n] (dorun (map #(.append *out* %) (repeat n \space)))))
+
+
 ;;;
 ;;; IdentityManagement (IAM)
 ;;;
@@ -178,7 +186,7 @@
   []
   (second (re-find #".*::(\d+):" (.getArn (iam-get-user)))))
         
-
+
 ;;;
 ;;; EC2 instance queries
 ;;;
@@ -191,6 +199,162 @@
         ec2 (AmazonEC2Client. creds)]
     (.setRegion ec2 *region*)
     ec2))
+
+(defn- sort-aws-tags
+  "Given a sequence of Tags, 
+   sort them lexicographically by key and value names unless there is a supplied
+   collection of key strings, in which case the order of keys in the collection
+   will be used as the sort order for any keys in map entries.  Tag keys whose names aren't
+
+   Example (sort-aws-tags (#Tag<:key foo :value bar> #Tag<:key Name :value fred>) [\"Name\"])
+           => (#Tag<:key Name :value fred> #Tag<:key foo :value bar>)
+   Normally the map with :key 'foo' would come first"
+  [tag-list preferred-keys]
+  (let [keysmap (if preferred-keys
+                  (into {} (for [x (range (count preferred-keys))] [(nth preferred-keys x) x]))
+                  {})
+        comp (fn [tag1 tag2]
+               (let [p1 (get keysmap (.getKey tag1)) ;'p' for priority
+                     p2 (get keysmap (.getKey tag2))]
+                 (cond (and p1 p2) (compare [p1 (.getValue tag1)] [p2 (.getValue tag2)])
+                       p1 -1               ;prioritied key sorts < nonprioritied key
+                       p2 1                ;nonprioritied key is > prioritied key
+                       ;; Neither map has a priority key
+                       :else (compare [(.getKey tag1) (.getValue tag1)]
+                                      [(.getKey tag2) (.getValue tag2)]))))]
+    (sort comp tag-list)))
+
+(defn- squish-tags
+  "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
+   E.g. [Name=this is a tag description, ...]"
+  [tag-list]
+  (mapv (fn [tag] (str (.getKey tag) "='" (.getValue tag) "'"))
+        (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
+
+(defn report-instances 
+  "Print a one line summary of all instances in a collection of DescribeInstancesResult objects.
+   If :vpc is true in options map, we print in vpc mode,
+   meaning we suppress the vpcid and instead print the subnet id."
+  ([describeInstancesResults] (report-instances describeInstancesResults {}))
+  ([describeInstancesResults opts]
+     (doseq [describeInstancesResult describeInstancesResults]
+       (doseq [reservation (.getReservations describeInstancesResult)]
+         (doseq [instance (.getInstances reservation)]
+           ;; *TODO*: formatter for these tuples like print-maps in core.clj,
+           ;; at which point <noXxx> goes away
+           (indent)
+           (println (.getInstanceId instance)
+                    (.getImageId instance)
+                    (if (:vpc opts)
+                      (.getSubnetId instance)
+                      (or (.getVpcId instance) "<noVpc>"))
+                    (or (.getPublicDnsName instance) "<noPublicDns>")
+                    (.getName (.getState instance))
+                    (.getInstanceType instance)
+                    (squish-tags (.getTags instance))))))))
+
+;;;
+;;; EC2 VPC
+;;;
+
+(defn print-ip-permission [ip-permission]
+  (println "from port" (.getFromPort ip-permission)
+           "protocol" (.getIpProtocol ip-permission)
+           "ranges" (seq (.getIpRanges ip-permission))
+           "to port" (.getToPort ip-permission)
+           "id grps" (seq (.getUserIdGroupPairs ip-permission))))
+
+(defn report-vpc-sg-permissions
+  []
+  (let [ec2 (ec2)
+        describeVpcResult (.describeVpcs ec2)]
+    (doseq [vpc (.getVpcs describeVpcResult)]
+      (println (.getVpcId vpc)
+               (.getCidrBlock vpc)
+               (.getState vpc)
+               (str "dflt=" (.isDefault vpc))
+               (squish-tags (.getTags vpc)))
+      (let [describeSecurityGroupsResult (.describeSecurityGroups
+                                          ec2 (doto (DescribeSecurityGroupsRequest.)
+                                                (.setFilters
+                                                 [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
+        (doseq [sg (.getSecurityGroups describeSecurityGroupsResult)]
+          (indent 2)
+          (println (.getGroupId sg)
+                   (.getGroupName sg)
+                   (.getDescription sg)
+                   (squish-tags (.getTags sg)))
+          (when-let [perms (seq (.getIpPermissions sg))]
+            (println "    Ingress:")
+            (doseq [ipPermission perms]
+              (indent 6)
+              (print-ip-permission ipPermission)))
+          (when-let [perms (seq (.getIpPermissionsEgress sg))]
+            (println "    Egress:")
+            (doseq [ipPermission perms]
+              (indent 6)
+              (print-ip-permission ipPermission))))))))
+                     
+(defn report-vpc-instances
+  []
+  (let [ec2 (ec2)
+        describeVpcResult (.describeVpcs ec2)]
+    (doseq [vpc (.getVpcs describeVpcResult)]
+      (println)
+      (println (.getVpcId vpc)
+               (.getCidrBlock vpc)
+               (.getState vpc)
+               (str "dflt=" (.isDefault vpc))
+               (squish-tags (.getTags vpc)))
+      ;; Instances in the vpc
+      (let [describeInstancesResult
+            (.describeInstances
+             ec2 (doto (DescribeInstancesRequest.)
+                   (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
+        (binding [*indent* (+ *indent* 4)]
+          (report-instances [describeInstancesResult] {:vpc true}))))))
+
+                     
+;;;
+;;; EC2 Scribe account specific
+;;;
+
+(defonce scribe-production-regions
+  [(Region/getRegion Regions/US_EAST_1) (Region/getRegion Regions/EU_WEST_1)
+   (Region/getRegion Regions/US_WEST_2) (Region/getRegion Regions/AP_SOUTHEAST_1)])
+(defonce scribe-preproduction-regions
+  [(Region/getRegion Regions/US_EAST_1) (Region/getRegion Regions/EU_WEST_1)])
+
+(defn ec2-get-production-scribe-instances
+  "Return a single DescribeInstanceResult for all production scribe servers in *region*."
+  []
+  (.describeInstances
+   (ec2)
+   (doto (DescribeInstancesRequest.)
+     (.setFilters
+      [(Filter. "tag-value" ["scribe-relay-0" "scribe-relay-1" "scribe-relay-2"])]))))
+
+(defn ec2-get-preproduction-scribe-instances
+  "Return a single DescribeInstanceResult for all pre-production scribe servers in *region*."
+  []
+  (.describeInstances
+   (ec2)
+   (doto (DescribeInstancesRequest.)
+     (.setFilters
+      [(Filter. "tag-value" ["preprod-scribe-relay-0" "preprod-scribe-relay-1" "preprod-scribe-relay-2"])]))))
+
+(defn ec2-get-all-preproduction-scribe-instances
+  "Return a collection of DescribeInstanceResults for all pre-production scribe servers in all regions."
+  []
+  (doall
+   (map (fn [region]
+          (binding [*region* region]
+            (ec2-get-preproduction-scribe-instances)))
+        scribe-preproduction-regions)))
+
+;;;
+;;; EC2 Misc
+;;;
 
 (defn ec2-describe-account-attributes
   []

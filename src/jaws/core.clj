@@ -319,11 +319,21 @@
                 keys)))
 
 
-;; (with-output ["/tmp/foo"] (print (ec2/describe-images :filters [{:owner-id "966829157592"}]))) (:owner-id "self") ?
-;;user> (time (def images (ec2/describe-images :filters [{:owner-id "966829157592"}])))
-;;"Elapsed time: 194558.469299 msecs"
-;;#'user/images
-;; PROBLEM!!!!
+;; Careful doing ec2/describe-images, there are about 28000 images available unless you filter them
+;; 200 seconds to report on those with this interface.  
+;; Oops:
+;; (time (with-output ["/tmp/foo"] (print (ec2/describe-images :owner "self"))))
+;; "Elapsed time: 284007.603638 msecs"
+;; This is the correct flavor (owner *collection*)
+;; *Still oops*: dang, would have been caught if Amazonica would warn about an unknown 'owner' keyword.
+;; Or did it?  Nope, I ran it without the output redirection, no error issued before it went down the
+;; rabbit hole.
+;; (time (with-output ["/tmp/foo"] (print (ec2/describe-images :owner ["self"]))))
+;; "Elapsed time: 257326.493222 msecs"
+;; (time (with-output ["/tmp/foo"] (print (ec2/describe-images :owners ["self"]))))
+;; *FINALLY* 
+;; (time (with-output ["/tmp/foo"] (print (ec2/describe-images :owners ["self"]))))
+;; "Elapsed time: 663.321882 msecs"
 
 ;; ALSO: how to change endpoint without respecifying access and secret keys?
 ;; I'm happy with those, I only want to vary the region by command
