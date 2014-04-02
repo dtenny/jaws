@@ -296,7 +296,7 @@
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified."
   [& {:keys [data vpc-mode region indent indent-incr]
-      :or {indent 0 indent-incr 2}}]
+      :or {indent *indent* indent-incr 2}}]
   (let [data (cond (instance? DescribeInstancesResult data) [data]
                    (coll? data) data
                    (seq? data) data
@@ -307,7 +307,7 @@
       (doseq [reservation (.getReservations describeInstancesResult)]
         (doseq [instance (.getInstances reservation)]
           (cl-format
-           true "~vT~a ~a ~a ~a ~a ~a ~a~%"
+           true "~v@T~a ~a ~a ~a ~a ~a ~a~%"
            indent
            (.getInstanceId instance)
            (.getImageId instance)
