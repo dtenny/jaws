@@ -9,6 +9,7 @@
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
+            DescribeInstancesResult
             DescribeImagesRequest DescribeInstancesRequest DescribeSecurityGroupsRequest Filter])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import java.io.File))
@@ -151,7 +152,32 @@
         (when (= credkey @current-cred-key)
           (println "Using new AWS credentials")))))
 
-(def ^:dynamic *region* (Region/getRegion Regions/US_EAST_1))
+(defonce
+  ^{:doc "region keyword to Regions enum mapping"}
+  region-map
+  (into {}
+        (map (fn [region-enum]
+               [(keyword (.getName region-enum))
+                (Region/getRegion region-enum)])
+             (seq (Regions/values)))))
+
+(def ^{:dynamic true :doc "Keyword indicating desired region for operations that don't otherwise specify a region."}
+  *region* :us-east-1)
+
+(defn regions-for-key
+  "Return a collection of regions (usually one) for some region-keyword from
+   'region-map' or :all.  If region-keyword is not in region-map or :all,
+   return the value of *region*.  If the keyword is :all, return all regions of
+   interest (a subset of all known regions, since I don't have any accounts
+   where I use all known regions yet)."
+  [region-key]
+  (cond (region-key region-map)
+        [(region-key region-map)]
+        (= region-key :all)
+        [(:us-east-1 region-map) (:eu-west-1 region-map)
+         (:us-west-2 region-map) (:ap-southeast-1 region-map)]
+        :else
+        [(*region* region-map)]))
 
 
 
@@ -173,7 +199,7 @@
   (let [current-creds (val (current-cred-map-entry))
         creds (BasicAWSCredentials. (first current-creds) (second current-creds))
         iam (AmazonIdentityManagementClient. creds)]
-    (.setRegion iam *region*)
+    (.setRegion iam (*region* region-map))
     iam))
 
 (defn iam-get-user
@@ -188,17 +214,33 @@
         
 
 ;;;
-;;; EC2 instance queries
+;;; EC2 - General
 ;;;
 
+;;; *TODO*: move to jdt.core
+(defn get-valid
+  "Return the value of (get map key). If key is not in map,
+   throw an IllegalArgumentException."
+  [map key]
+  (let [result (get map key get-valid)]
+    (if (= result get-valid)
+      (throw (IllegalArgumentException. (str "No such key " key " in map.")))
+      result)))
+
 (defn- ^AmazonEC2Client ec2
-  "Return an AmazonEC2Client instance ready for calls."
-  []
-  (let [current-creds (val (current-cred-map-entry))
-        creds (BasicAWSCredentials. (first current-creds) (second current-creds))
-        ec2 (AmazonEC2Client. creds)]
-    (.setRegion ec2 *region*)
-    ec2))
+  "Return an AmazonEC2Client instance ready for calls for a single (optional) region."
+  ([] (ec2 *region*))
+  ([region]
+     (let [current-creds (val (current-cred-map-entry))
+           creds (BasicAWSCredentials. (first current-creds) (second current-creds))
+           ec2 (AmazonEC2Client. creds)
+           region (if (instance? Region region) region (get-valid region-map region))]
+       (.setRegion ec2 region)
+       ec2)))
+
+;;;
+;;; EC2 - instance queries
+;;;
 
 (defn- sort-aws-tags
   "Given a sequence of Tags, 
@@ -231,27 +273,77 @@
   (mapv (fn [tag] (str (.getKey tag) "='" (.getValue tag) "'"))
         (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
 
+
 (defn report-instances 
-  "Print a one line summary of all instances in a collection of DescribeInstancesResult objects.
-   If :vpc is true in options map, we print in vpc mode,
-   meaning we suppress the vpcid and instead print the subnet id."
-  ([describeInstancesResults] (report-instances describeInstancesResults {}))
-  ([describeInstancesResults opts]
-     (doseq [describeInstancesResult describeInstancesResults]
-       (doseq [reservation (.getReservations describeInstancesResult)]
-         (doseq [instance (.getInstances reservation)]
-           ;; *TODO*: formatter for these tuples like print-maps in core.clj,
-           ;; at which point <noXxx> goes away
-           (indent)
-           (println (.getInstanceId instance)
-                    (.getImageId instance)
-                    (if (:vpc opts)
-                      (.getSubnetId instance)
-                      (or (.getVpcId instance) "<noVpc>"))
-                    (or (.getPublicDnsName instance) "<noPublicDns>")
-                    (.getName (.getState instance))
-                    (.getInstanceType instance)
-                    (squish-tags (.getTags instance))))))))
+  "Print a information about instances.
+   The default is to print one line of information per instance, unless options
+   are specified for other details.
+
+   Options:
+   :indent all lines with the indicated (minimum) number of leading spaces
+           indentation desired (default zero).  note that secondary lines (if
+           more than one line per instance is printed) are indented an
+           additional indent-incr spaces.
+   :indent-incr amount to additionally indent secondary data lines (for
+                options where more than one line per instance is printed. Default 2.
+   :vpc-mode we print in vpc mode, meaning we suppress the vpcid and instead
+             print the subnet id under the assumpion information about the
+             containing vpc is evident through other means.
+   :data A DescribeInstancesResult object, or collection of those objects, to
+         be reported upon.  If not specified a describeInstances operation is
+         performed to get data.
+   :region a region keyword from 'region-map', or :all, in which case
+           iff :data is unspecified, data will be fetched from all regions.
+           :region is ignored if :data is specified."
+  [& {:keys [data vpc-mode region indent indent-incr]
+      :or {indent 0 indent-incr 2}}]
+  (let [data (cond (instance? DescribeInstancesResult data) [data]
+                   (coll? data) data
+                   (seq? data) data
+                   (not data) (map #(.describeInstances (ec2 %))
+                                   (regions-for-key region))
+                   :else (throw (Exception. (str "unexpected data: " data))))]
+    (doseq [describeInstancesResult data]
+      (doseq [reservation (.getReservations describeInstancesResult)]
+        (doseq [instance (.getInstances reservation)]
+          (cl-format
+           true "~vT~a ~a ~a ~a ~a ~a ~a~%"
+           indent
+           (.getInstanceId instance)
+           (.getImageId instance)
+           (if vpc-mode
+             (.getSubnetId instance)
+             (or (.getVpcId instance) "<noVpc>"))
+           (or (.getPublicDnsName instance) "<noPublicDns>")
+           (.getName (.getState instance))
+           (.getInstanceType instance)
+           (squish-tags (.getTags instance))))))))
+
+
+;;;
+;;; EC2 Security groups
+;;; 
+
+(defn report-sgs
+  "Print a one line summary (unless options specify otherwise)
+   of security groups for one or more DescribeSecurityGroupsResults instances."
+;; *TODO*: options for region(? - and including :all) and and for :ingress :egress
+;; :region may be a standard option for all things that roll an ec2
+;; maybe also some :regex filtering options, though if we just return tuples
+;; caller can do that other ways
+  ([] (report-sgs [(.describeSecurityGroups (ec2))]))
+  ([describeSecurityGroupsResults] (report-sgs describeSecurityGroupsResults {}))
+  ([describeSecurityGroupsResults opts]
+     (doseq [describeSecurityGroupsResult describeSecurityGroupsResults]
+       (doseq [sg (.getSecurityGroups describeSecurityGroupsResult)]
+         (cl-format true "~a ~a ~a ~a ~a ~s~%"
+                    (.getGroupId sg)
+                    (.getGroupName sg)
+                    (.getOwnerId sg)
+                    (or (.getVpcId sg) "<novpc>")
+                    (squish-tags (.getTags sg))
+                    (.getDescription sg))))))
+
 
 ;;;
 ;;; EC2 VPC
@@ -312,45 +404,45 @@
              ec2 (doto (DescribeInstancesRequest.)
                    (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (binding [*indent* (+ *indent* 4)]
-          (report-instances [describeInstancesResult] {:vpc true}))))))
+          (report-instances :data describeInstancesResult :vpc-mode true))))))
 
                      
 ;;;
 ;;; EC2 Scribe account specific
 ;;;
 
-(defonce scribe-production-regions
-  [(Region/getRegion Regions/US_EAST_1) (Region/getRegion Regions/EU_WEST_1)
-   (Region/getRegion Regions/US_WEST_2) (Region/getRegion Regions/AP_SOUTHEAST_1)])
-(defonce scribe-preproduction-regions
-  [(Region/getRegion Regions/US_EAST_1) (Region/getRegion Regions/EU_WEST_1)])
+(defonce scribe-production-regions [:us-east-1 :eu-west-1 :us-west-2 :ap-southeast-1])
+(defonce scribe-preproduction-regions [:us-east-1 :eu-west-1])
 
-(defn ec2-get-production-scribe-instances
+(defn scribe-production-instances
   "Return a single DescribeInstanceResult for all production scribe servers in *region*."
   []
   (.describeInstances
    (ec2)
    (doto (DescribeInstancesRequest.)
-     (.setFilters
-      [(Filter. "tag-value" ["scribe-relay-0" "scribe-relay-1" "scribe-relay-2"])]))))
+     (.setFilters 
+      [(Filter. "tag-value" (for [i (range 3)] (str "scribe-relay-" i)))]))))
 
-(defn ec2-get-preproduction-scribe-instances
+(defn scribe-all-production-instances
+  "Return a single DescribeInstanceResult for all production scribe servers in all regions."
+  []
+  (for [region scribe-production-regions]
+    (binding [*region* region] (scribe-production-instances))))
+
+(defn scribe-preproduction-instances
   "Return a single DescribeInstanceResult for all pre-production scribe servers in *region*."
   []
   (.describeInstances
    (ec2)
    (doto (DescribeInstancesRequest.)
      (.setFilters
-      [(Filter. "tag-value" ["preprod-scribe-relay-0" "preprod-scribe-relay-1" "preprod-scribe-relay-2"])]))))
+      [(Filter. "tag-value" (for [i (range 3)] (str "scribe-relay-preprod-" i)))]))))
 
-(defn ec2-get-all-preproduction-scribe-instances
+(defn scribe-all-preproduction-instances
   "Return a collection of DescribeInstanceResults for all pre-production scribe servers in all regions."
   []
-  (doall
-   (map (fn [region]
-          (binding [*region* region]
-            (ec2-get-preproduction-scribe-instances)))
-        scribe-preproduction-regions)))
+  (for [region scribe-preproduction-regions]
+    (binding [*region* region] (scribe-preproduction-instances))))
 
 ;;;
 ;;; EC2 Misc
