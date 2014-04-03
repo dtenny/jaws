@@ -184,8 +184,8 @@
 ;;; Stupid reporting aids
 (def- ^:dynamic *indent* "Number of spaces to indent each line printed" 0)
 
-(defn- indent "Print n spaces *out*"
-  ([] (indent *indent*))
+(defn- do-indent "Print n spaces *out*"
+  ([] (do-indent *indent*))
   ([n] (dorun (map #(.append *out* %) (repeat n \space)))))
 
 
@@ -286,6 +286,16 @@
         (nil? x) ()
         :else (list x)))
 
+(defn instance-volume-ids
+  "Return a collection of ebs volume IDs attached to an Instance object.
+   Often called implicitly via:
+   (report-instances :instances (describe-instances :tag-regex #\"(?i)created\")
+                                :fields #{:VolumeIds})"
+  [instance]
+  (->> (.getBlockDeviceMappings instance)
+       (map (fn [mapping] (.getEbs mapping)))
+       (map (fn [dev] (.getVolumeId dev)))))
+
 (defn- describeInstancesResult->instances
   "Convert DescribeInsancesResult objects to a sequence of instances.
    The argument may be a singleton DescribeInstancesResult or a collection of them."
@@ -309,9 +319,6 @@
            additional indent-incr spaces.
    :indent-incr amount to additionally indent secondary data lines (for
                 options where more than one line per instance is printed. Default 2.
-   :vpc-mode we print in vpc mode, meaning we suppress the vpcid and instead
-             print the subnet id under the assumpion information about the
-             containing vpc is evident through other means.
    :data A DescribeInstancesResult object or collection of those objects to
          be reported upon.  If neither this nor :instances is specified,
          (describe-instances) is called to retrieve data.
@@ -321,9 +328,17 @@
               (all together).
    :region a region keyword from 'region-map', or :all, in which case
            iff :data is unspecified, data will be fetched from all regions.
-           :region is ignored if :data is specified."
-  [& {:keys [data instances vpc-mode region indent indent-incr]
-      :or {indent *indent* indent-incr 2}}]
+           :region is ignored if :data is specified.
+   :fields Set of fields (information) to display in addition to instance id.
+           Defaults to: #{:ImageId :SubnetId :PublicDnsName :State :InstanceType :Tags}
+           Additional options include: :VolumeIds
+   :include Set of additional fields to display, defaults to #{}
+   :exclude Set of fields to exclude from the display, defaults to #{}.
+   Note that presently you can't specify the order of fields."
+  [& {:keys [data instances vpc-mode region indent indent-incr fields include exclude]
+      :or {indent *indent* indent-incr 2
+           fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :Tags}
+           include #{} exclude #{} }}]
   (let [instances1 (and data (describeInstancesResult->instances data))
         instances2 (and instances (seqify instances))
         instances3 (concat instances1 instances2)
@@ -331,20 +346,26 @@
                        (describeInstancesResult->instances
                         (map #(.describeInstances (ec2 %))
                              (regions-for-key region)))
-                       instances3)]
+                       instances3)
+        fields (difference (union fields include) exclude)
+        ps (fn [x] (print x) (print " "))
+        pa (fn [x] (pr x) (print " "))]
     (doseq [instance instances4]
-      (cl-format
-       true "~v@T~a ~a ~a ~a ~a ~a ~a~%"
-       indent
-       (.getInstanceId instance)
-       (.getImageId instance)
-       (if vpc-mode
-         (.getSubnetId instance)
-         (or (.getVpcId instance) "<noVpc>"))
-       (or (.getPublicDnsName instance) "<noPublicDns>")
-       (.getName (.getState instance))
-       (.getInstanceType instance)
-       (squish-tags (.getTags instance))))))
+      (do-indent)
+      (ps (.getInstanceId instance))
+      ;; Macro anyone, for the following?
+      (if (:ImageId fields) (ps (.getImageId instance)))
+      (if (:VpcId fields) (ps (or (.getVpcId instance) "<noVpc>")))
+      (if (:SubnetId fields) (ps (or (.getSubnetId instance) "<noSubnet>")))
+      (if (:PublicDnsName fields)
+        (let [name (.getPublicDnsName instance)]
+          (ps (or (and name (> (count name) 0) name)
+                  "<noPublicDns>"))))
+      (if (:State fields) (ps (.getName (.getState instance))))
+      (if (:InstanceType fields) (ps (.getInstanceType instance)))
+      (if (:Tags fields) (pa (squish-tags (.getTags instance))))
+      (if (:VolumeIds fields) (ps (instance-volume-ids instance)))
+      (println))))
 
 ;;; *TODO*: put this in jdt.core
 (defn always-nil "A function that always returns nil."
@@ -368,7 +389,8 @@
 ;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
 (defn describe-instances
   "Retrieve one or more Instances with various filters and regions applied.
-   Returns a collection that can be fed as :data to 'report-instances'.
+   Returns a collection that can be fed as :data to 'report-instances', e.g.
+   (report-instances :instances (describe-instances :tag-regex #\"(?i)created\"))
    Options:
    :region a region keyword from 'region-map', or :all to operate on all regions.
    :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
@@ -439,7 +461,7 @@
                                                 (.setFilters
                                                  [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (doseq [sg (.getSecurityGroups describeSecurityGroupsResult)]
-          (indent 2)
+          (do-indent 2)
           (println (.getGroupId sg)
                    (.getGroupName sg)
                    (.getDescription sg)
@@ -447,12 +469,12 @@
           (when-let [perms (seq (.getIpPermissions sg))]
             (println "    Ingress:")
             (doseq [ipPermission perms]
-              (indent 6)
+              (do-indent 6)
               (print-ip-permission ipPermission)))
           (when-let [perms (seq (.getIpPermissionsEgress sg))]
             (println "    Egress:")
             (doseq [ipPermission perms]
-              (indent 6)
+              (do-indent 6)
               (print-ip-permission ipPermission))))))))
                      
 (defn report-vpc-instances
@@ -473,7 +495,7 @@
              ec2 (doto (DescribeInstancesRequest.)
                    (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (binding [*indent* (+ *indent* 4)]
-          (report-instances :data describeInstancesResult :vpc-mode true))))))
+          (report-instances :data describeInstancesResult :exclude #{:VpcId}))))))
 
                      
 ;;;
