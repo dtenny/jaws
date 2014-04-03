@@ -171,7 +171,7 @@
    interest (a subset of all known regions, since I don't have any accounts
    where I use all known regions yet)."
   [region-key]
-  (cond (region-key region-map)
+  (cond (get region-map region-key)
         [(region-key region-map)]
         (= region-key :all)
         [(:us-east-1 region-map) (:eu-west-1 region-map)
@@ -273,6 +273,29 @@
   (mapv (fn [tag] (str (.getKey tag) "='" (.getValue tag) "'"))
         (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
 
+;; *TODO*: put this in jdt.core
+(defn seqify
+  "If x is a singleton datum, return some kind of sequence of one element, x.
+   If x is a collection return a sequence for it.
+   If x is a sequence, return it as is.
+   Nil is given special treatment and is turned into an empty sequence,
+   however false is nto converted into an empty sequence."
+  [x]
+  (cond (seq? x) x
+        (coll? x) (seq x)
+        (nil? x) ()
+        :else (list x)))
+
+(defn- describeInstancesResult->instances
+  "Convert DescribeInsancesResult objects to a sequence of instances.
+   The argument may be a singleton DescribeInstancesResult or a collection of them."
+  [results]
+  (->> (seqify results)
+       flatten
+       (map (fn [describeInstancesResult] (seq (.getReservations describeInstancesResult))))
+       flatten
+       (map (fn [reservation] (seq (.getInstances reservation))))
+       flatten))
 
 (defn report-instances 
   "Print a information about instances.
@@ -289,36 +312,81 @@
    :vpc-mode we print in vpc mode, meaning we suppress the vpcid and instead
              print the subnet id under the assumpion information about the
              containing vpc is evident through other means.
-   :data A DescribeInstancesResult object, or collection of those objects, to
-         be reported upon.  If not specified a describeInstances operation is
-         performed to get data.
+   :data A DescribeInstancesResult object or collection of those objects to
+         be reported upon.  If neither this nor :instances is specified,
+         (describe-instances) is called to retrieve data.
+   :instances An Instance collection of instances.  If neither this nor :data
+              is speciied, (describe-instances is called to retrieve data.
+              If both are specified, the resulting instances from each field are used
+              (all together).
    :region a region keyword from 'region-map', or :all, in which case
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified."
-  [& {:keys [data vpc-mode region indent indent-incr]
+  [& {:keys [data instances vpc-mode region indent indent-incr]
       :or {indent *indent* indent-incr 2}}]
-  (let [data (cond (instance? DescribeInstancesResult data) [data]
-                   (coll? data) data
-                   (seq? data) data
-                   (not data) (map #(.describeInstances (ec2 %))
-                                   (regions-for-key region))
-                   :else (throw (Exception. (str "unexpected data: " data))))]
-    (doseq [describeInstancesResult data]
-      (doseq [reservation (.getReservations describeInstancesResult)]
-        (doseq [instance (.getInstances reservation)]
-          (cl-format
-           true "~v@T~a ~a ~a ~a ~a ~a ~a~%"
-           indent
-           (.getInstanceId instance)
-           (.getImageId instance)
-           (if vpc-mode
-             (.getSubnetId instance)
-             (or (.getVpcId instance) "<noVpc>"))
-           (or (.getPublicDnsName instance) "<noPublicDns>")
-           (.getName (.getState instance))
-           (.getInstanceType instance)
-           (squish-tags (.getTags instance))))))))
+  (let [instances1 (and data (describeInstancesResult->instances data))
+        instances2 (and instances (seqify instances))
+        instances3 (concat instances1 instances2)
+        instances4 (if (empty? instances3)
+                       (describeInstancesResult->instances
+                        (map #(.describeInstances (ec2 %))
+                             (regions-for-key region)))
+                       instances3)]
+    (doseq [instance instances4]
+      (cl-format
+       true "~v@T~a ~a ~a ~a ~a ~a ~a~%"
+       indent
+       (.getInstanceId instance)
+       (.getImageId instance)
+       (if vpc-mode
+         (.getSubnetId instance)
+         (or (.getVpcId instance) "<noVpc>"))
+       (or (.getPublicDnsName instance) "<noPublicDns>")
+       (.getName (.getState instance))
+       (.getInstanceType instance)
+       (squish-tags (.getTags instance))))))
 
+;;; *TODO*: put this in jdt.core
+(defn always-nil "A function that always returns nil."
+  [& args]
+  nil)
+
+(defn- tag-regex-find-fn 
+  "Return a function of one argument that takes calls .getTags on the argument
+   the result of re-find if (re-find regex <x>) is true for either the tag key
+   or the tag value for any tag returned.  re-find is called on the key first, then the
+   value, it is not called on the value if the key test returns a logically
+   true value."
+  [regex]
+  {:pre [(instance? java.util.regex.Pattern regex)]}
+  (fn [taggable]
+    (some (fn [tag]
+            (or (re-find regex (.getKey tag))
+                (re-find regex (.getValue tag))))
+          (seq (.getTags taggable)))))
+
+;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
+(defn describe-instances
+  "Retrieve one or more Instances with various filters and regions applied.
+   Returns a collection that can be fed as :data to 'report-instances'.
+   Options:
+   :region a region keyword from 'region-map', or :all to operate on all regions.
+   :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
+              values as a filter.  Instances lacking the regex will not be returned.
+              Instances are only returned if the regex passes a 'find', not a
+              'matches' operation. '(?i)' may be useful in your regex to ignore case.
+              Note that tag regexes must filter tags after retrieval from amazon."
+  [& {:keys [region tag-regex]}]
+  (let [regions (regions-for-key region)
+        tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
+    (->> (map (fn [region] (.describeInstances (ec2 region))) regions)
+         flatten
+         (map (fn [descInsRes] (seq (.getReservations descInsRes))))
+         flatten
+         (map (fn [reservation] (seq (.getInstances reservation))))
+         flatten
+         (filter tag-regex-fn)
+         )))
 
 ;;;
 ;;; EC2 Security groups
@@ -388,6 +456,7 @@
               (print-ip-permission ipPermission))))))))
                      
 (defn report-vpc-instances
+  "Print summary of instances in vpcs, grouped by vpc."
   []
   (let [ec2 (ec2)
         describeVpcResult (.describeVpcs ec2)]
