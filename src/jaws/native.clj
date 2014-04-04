@@ -9,8 +9,11 @@
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
+            CreateTagsRequest
             DescribeInstancesResult
-            DescribeImagesRequest DescribeInstancesRequest DescribeSecurityGroupsRequest Filter])
+            DescribeImagesRequest DescribeInstancesRequest DescribeSecurityGroupsRequest
+            DescribeTagsRequest
+            Filter Instance Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import java.io.File))
 
@@ -137,8 +140,14 @@
   (defcred (prompt-for-credentials))
   (println "Current creds:" (current-cred-map-entry)))
 
-(if-not @current-cred-key
-  (choose-creds))
+(defn make-aws-creds
+  "Make some flavor of aws credentials such as BasicAWSCredentials from previously selected credentials
+   and return them. Complain if credentials haven't been set with (choose-creds) or similar mechanism."
+  []
+  (if-not @current-cred-key
+    (throw (Exception. "Credentials have not been set, use (choose-creds) or (defcred)")))
+  (let [current-creds (val (current-cred-map-entry))]
+    (BasicAWSCredentials. (first current-creds) (second current-creds))))
 
 (defn update-cred
   "Given a key value pair as would be present in 'cred-map',
@@ -193,12 +202,10 @@
 ;;; IdentityManagement (IAM)
 ;;;
 
-(defn- ^AmazonIdentityManagementClient iam
+(defn ^AmazonIdentityManagementClient iam
   "Return an AmazonIdentityManagementClient ready for calls."
   []
-  (let [current-creds (val (current-cred-map-entry))
-        creds (BasicAWSCredentials. (first current-creds) (second current-creds))
-        iam (AmazonIdentityManagementClient. creds)]
+  (let [iam (AmazonIdentityManagementClient. (make-aws-creds))]
     (.setRegion iam (*region* region-map))
     iam))
 
@@ -211,6 +218,22 @@
   "Return the account number as a string from a User"
   []
   (second (re-find #".*::(\d+):" (.getArn (iam-get-user)))))
+
+(defn report-roles
+  []
+  (let [result (.listRoles (iam))
+        dateFormatter (java.text.SimpleDateFormat. "yyyyMMdd-HHmmssZ")
+        dateFormat (fn [date] (.format dateFormatter date))]
+    (if (.getIsTruncated result)
+      (println "** TRUNCATED **"))
+    (doseq [role (.getRoles result)]
+      (println (.getRoleId role)
+               ;;(.getRoleName role)
+               ;;(.getPath role)
+               (dateFormat (.getCreateDate role))
+               (.getArn role))
+      ;;(println "   " (.getAssumeRolePolicyDocument role))
+      )))
         
 
 ;;;
@@ -227,20 +250,60 @@
       (throw (IllegalArgumentException. (str "No such key " key " in map.")))
       result)))
 
-(defn- ^AmazonEC2Client ec2
-  "Return an AmazonEC2Client instance ready for calls for a single (optional) region."
+(defn ^AmazonEC2Client ec2
+  "Return an AmazonEC2Client instance ready for calls for a single (optional) region.
+   'region' is a keyword defaulting to *region*."
   ([] (ec2 *region*))
   ([region]
-     (let [current-creds (val (current-cred-map-entry))
-           creds (BasicAWSCredentials. (first current-creds) (second current-creds))
-           ec2 (AmazonEC2Client. creds)
+     (let [ec2 (AmazonEC2Client. (make-aws-creds))
            region (if (instance? Region region) region (get-valid region-map region))]
        (.setRegion ec2 region)
        ec2)))
 
+
+(defn report-tags
+  "Print tag information for any specific EC2 entity that can have tags.
+   Specify the entity ID."
+  [entity]
+  (let [result (.describeTags (ec2)
+                 (doto (DescribeTagsRequest.)
+                   (.setFilters [(Filter. "resource-id" [entity])])))
+        tagDescriptions (.getTags result)]
+    (if (empty? tagDescriptions)
+      (println "No tags exist for" entity)
+      (doseq [tagDescription tagDescriptions]
+        (println (.getResourceId tagDescription)
+                 (.getKey tagDescription)
+                 (.getResourceType tagDescription)
+                 (.getValue tagDescription))))))
+  
+(defn create-tags
+  "Create tags for any specific EC2 entity that can have tags.
+   Specify the entity ID and a map of tag key/value pairs.
+   Strings and vals are assumed strings, however keywords are acceptable
+   in which case their names will be used.
+   Returns nil."
+  [entity tag-map]
+  {:pre [(map? tag-map)]}
+  (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
+        tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
+    (.createTags (ec2) (CreateTagsRequest. (list entity) tags))))
+    
+
 ;;;
 ;;; EC2 - instance queries
 ;;;
+
+(def instance-state-code-map "Map of InstanceState codes to keywords"
+  {0 :pending, 16 :running, 32 :shutting-down, 48 :terminated, 64 :stopping, 80 :stopped})
+
+(defmulti  instance-state
+    "Retrieve instance state for an EC2 instance as a keyword, e.g. :running"
+    class)
+(defmethod instance-state String [instance-id]
+  (instance-state (first (describe-instances :ids instance-id))))
+(defmethod instance-state Instance [instance]
+  (get instance-state-code-map (.getCode (.getState instance)) :unknown-state-code))
 
 (defn- sort-aws-tags
   "Given a sequence of Tags, 
@@ -286,6 +349,21 @@
         (nil? x) ()
         :else (list x)))
 
+;; *TODO*: put this in jdt.core
+(defn listify
+  "Similar to seqify, but ensures that the returned collection type is a List.
+   If x is a singleton datum, return a list of one element, x.
+   If x is a non-list collection return a list for it.
+   If x is a sequence, return it as a list.
+   Nil is given special treatment and is turned into an empty list
+   however false is not converted into an empty sequence."
+  [x]
+  (cond (list? x) x
+        (seq? x) (into () x)
+        (coll? x) (into () x)
+        (nil? x) ()
+        :else (list x)))
+
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object.
    Often called implicitly via:
@@ -325,7 +403,8 @@
    :instances An Instance collection of instances.  If neither this nor :data
               is speciied, (describe-instances is called to retrieve data.
               If both are specified, the resulting instances from each field are used
-              (all together).
+              (all together).  Note that you can turn instance IDs to instances
+              via 'describe-instances'.
    :region a region keyword from 'region-map', or :all, in which case
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified.
@@ -339,6 +418,7 @@
       :or {indent *indent* indent-incr 2
            fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :Tags}
            include #{} exclude #{} }}]
+  {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [instances1 (and data (describeInstancesResult->instances data))
         instances2 (and instances (seqify instances))
         instances3 (concat instances1 instances2)
@@ -372,6 +452,9 @@
   [& args]
   nil)
 
+;; *TODO*: note that Filter values can have '*' and '?', as per
+;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
+
 (defn- tag-regex-find-fn 
   "Return a function of one argument that takes calls .getTags on the argument
    the result of re-find if (re-find regex <x>) is true for either the tag key
@@ -393,15 +476,22 @@
    (report-instances :instances (describe-instances :tag-regex #\"(?i)created\"))
    Options:
    :region a region keyword from 'region-map', or :all to operate on all regions.
+   :ids a string instance ID, or collection/sequence of same, specifying specific instances
+        whose data should be retrieved.
    :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
               values as a filter.  Instances lacking the regex will not be returned.
               Instances are only returned if the regex passes a 'find', not a
               'matches' operation. '(?i)' may be useful in your regex to ignore case.
               Note that tag regexes must filter tags after retrieval from amazon."
-  [& {:keys [region tag-regex]}]
+  [& {:keys [region tag-regex ids]}]
   (let [regions (regions-for-key region)
+        fetch-fn (if ids
+                   (fn [region] (.describeInstances (ec2 region)
+                                                    (doto (DescribeInstancesRequest.)
+                                                      (.setInstanceIds (seqify ids)))))
+                   (fn [region] (.describeInstances (ec2 region))))
         tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
-    (->> (map (fn [region] (.describeInstances (ec2 region))) regions)
+    (->> (map fetch-fn regions)
          flatten
          (map (fn [descInsRes] (seq (.getReservations descInsRes))))
          flatten
@@ -409,6 +499,23 @@
          flatten
          (filter tag-regex-fn)
          )))
+
+(defn terminate-instances
+  "Terminate one or more instances.
+   :region a region keyword from 'region-map' to override *region*.
+   ids a string instance ID or collection/sequence of same specifying specific instances
+        to be deleted."
+  [ids & {:keys [region]
+          :or {region *region*}}]
+  {:pre [(not (= region :all))]}
+  (doseq [instanceStateChange 
+          (->> (.terminateInstances (ec2 region)
+                                    (TerminateInstancesRequest. (listify ids)))
+               (.getTerminatingInstances))]
+    (println (.getInstanceId instanceStateChange)
+             (.getName (.getPreviousState instanceStateChange))
+             "=>"
+             (.getName (.getCurrentState instanceStateChange)))))
 
 ;;;
 ;;; EC2 Security groups
@@ -590,3 +697,8 @@
       #_ (doseq [image images] (println (str image))) ; /tmp/native-images
       )))
           
+(defn report-key-pairs
+  []
+  (doseq [keyPairInfo (.getKeyPairs (.describeKeyPairs (ec2)))]
+    (println (.getKeyName keyPairInfo)
+             (.getKeyFingerprint keyPairInfo))))
