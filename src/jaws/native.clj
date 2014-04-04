@@ -10,12 +10,25 @@
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             CreateTagsRequest
-            DescribeInstancesResult
-            DescribeImagesRequest DescribeInstancesRequest DescribeSecurityGroupsRequest
-            DescribeTagsRequest
+            DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
+            DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
+  (:import [com.amazonaws.services.identitymanagement.model
+            GetInstanceProfileRequest GetRoleRequest])
   (:import java.io.File))
+
+;;;
+;;; Conventions
+;;;
+;;; Functions named 'describe-*' or 'list-*' are named after AWS methods.
+;;; Functions named 'report-*' are things that use 'describe-*' results to print reports on that data.
+;;; Most report functions default to one-line-per-entity formats unless other options are specified.
+;;;
+;;; Unless an identifier says "*-id" then the object in question is probably an AWS entity, not an entity id.
+;;; I.e. 'instance' will be an Instance object, not an instance id.  Usually the documentation will clarify
+;;; questions on the formal parameters, if there are any.
+;;;
 
 (defn- ensure-one-line "Fail we matched other than one line" [matched-lines key]
   (when (> (count matched-lines) 1)
@@ -209,15 +222,36 @@
     (.setRegion iam (*region* region-map))
     iam))
 
-(defn iam-get-user
-  "Get a com.amazonaws.services.identitymanagement.model.User"
+(defn iam-get-user-name
+  "Get a the currently credential user's user name"
   []
-  (.getUser (.getUser (iam))))
+  (.getUserName (.getUser (.getUser (iam)))))
 
 (defn iam-get-user-account-number
   "Return the account number as a string from a User"
   []
-  (second (re-find #".*::(\d+):" (.getArn (iam-get-user)))))
+  (second (re-find #".*::(\d+):" (.getArn (.getUser (.getUser (iam)))))))
+
+(defn role-name-exists?
+  "Return true if the specified IAM role name exists, false otherwise"
+  [role-name]
+  (try
+    ;; This throws an exception if the role does not exist 
+    (.getRole (iam) 
+              (doto (GetRoleRequest.) (.setRoleName role-name)))
+    true
+    (catch Exception e false)))
+
+(defn instance-profile-name-exists?
+  "Return true if the specified IAM Instance Profile name exists, false otherwise.
+   'name' refers to the user name, not the ARN."
+  [ip-name]
+  (try
+    (.getInstanceProfile (iam)
+                         (doto (GetInstanceProfileRequest.)
+                           (.setInstanceProfileName ip-name)))
+    true
+    (catch Exception e false)))
 
 (defn report-roles
   []
@@ -225,7 +259,7 @@
         dateFormatter (java.text.SimpleDateFormat. "yyyyMMdd-HHmmssZ")
         dateFormat (fn [date] (.format dateFormatter date))]
     (if (.getIsTruncated result)
-      (println "** TRUNCATED **"))
+      (println "** TRUNCATED **"))      ;TODO: make sure we don't get this
     (doseq [role (.getRoles result)]
       (println (.getRoleId role)
                ;;(.getRoleName role)
@@ -234,7 +268,20 @@
                (.getArn role))
       ;;(println "   " (.getAssumeRolePolicyDocument role))
       )))
-        
+
+(defn report-instance-profiles
+  []
+  (let [result (.listInstanceProfiles (iam))]
+    (if (.getIsTruncated result)
+      (println "** TRUNCATED **"))      ;TODO: make sure we don't get this.
+    (println "ProfileId ProfileName Arn Roles")
+    (doseq [ip (.getInstanceProfiles result)]
+      (println (.getInstanceProfileId ip)
+               (.getInstanceProfileName ip)
+               ;; (.getPath ip)
+               (.getArn ip)
+               (map (fn [role] (.getRoleName role)) (.getRoles ip))))))
+
 
 ;;;
 ;;; EC2 - General
@@ -260,6 +307,27 @@
        (.setRegion ec2 region)
        ec2)))
 
+
+(defn key-pair-exists?
+  "Return true if key pair name exists on current credentialed account, false otherwise"
+  [key-pair-name]
+  (let [result (.describeKeyPairs (ec2)
+                (doto (DescribeKeyPairsRequest.)
+                  (.setFilters [(Filter. "key-name" [key-pair-name])])))
+        key-pairs (.getKeyPairs result)]
+    (= (count key-pairs) 1)))
+
+(defn security-group-name-exists?
+  "Return true if the specified security group name exists, false if it does not."
+  [group-name]
+  ;; Throws if the gruop does not exist.
+  (try 
+    (let [result (.describeSecurityGroups (ec2)
+                                          (doto (DescribeSecurityGroupsRequest.)
+                                            (.setGroupNames [group-name])))]
+      (>= (count (.getSecurityGroups result)) 1))
+    true
+    (catch Exception e false)))
 
 (defn report-tags
   "Print tag information for any specific EC2 entity that can have tags.
@@ -293,6 +361,7 @@
 ;;;
 ;;; EC2 - instance queries
 ;;;
+(declare describe-instances)
 
 (def instance-state-code-map "Map of InstanceState codes to keywords"
   {0 :pending, 16 :running, 32 :shutting-down, 48 :terminated, 64 :stopping, 80 :stopped})
@@ -405,23 +474,25 @@
               If both are specified, the resulting instances from each field are used
               (all together).  Note that you can turn instance IDs to instances
               via 'describe-instances'.
+   :ids An instance ID or collection thereof, passed to 'describe-instances'.
    :region a region keyword from 'region-map', or :all, in which case
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
            Defaults to: #{:ImageId :SubnetId :PublicDnsName :State :InstanceType :Tags}
-           Additional options include: :VolumeIds
+           Additional options include: :VolumeIds, :InstanceProfile.
    :include Set of additional fields to display, defaults to #{}
    :exclude Set of fields to exclude from the display, defaults to #{}.
    Note that presently you can't specify the order of fields."
-  [& {:keys [data instances vpc-mode region indent indent-incr fields include exclude]
+  [& {:keys [data instances ids vpc-mode region indent indent-incr fields include exclude]
       :or {indent *indent* indent-incr 2
            fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :Tags}
            include #{} exclude #{} }}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [instances1 (and data (describeInstancesResult->instances data))
         instances2 (and instances (seqify instances))
-        instances3 (concat instances1 instances2)
+        instances2a (and ids (describe-instances :ids ids))
+        instances3 (concat instances1 instances2 instances2a)
         instances4 (if (empty? instances3)
                        (describeInstancesResult->instances
                         (map #(.describeInstances (ec2 %))
@@ -443,6 +514,7 @@
                   "<noPublicDns>"))))
       (if (:State fields) (ps (.getName (.getState instance))))
       (if (:InstanceType fields) (ps (.getInstanceType instance)))
+      (if (:InstanceProfile fields) (ps (.getArn (.getIamInstanceProfile instance))))
       (if (:Tags fields) (pa (squish-tags (.getTags instance))))
       (if (:VolumeIds fields) (ps (instance-volume-ids instance)))
       (println))))
@@ -451,9 +523,6 @@
 (defn always-nil "A function that always returns nil."
   [& args]
   nil)
-
-;; *TODO*: note that Filter values can have '*' and '?', as per
-;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
 
 (defn- tag-regex-find-fn 
   "Return a function of one argument that takes calls .getTags on the argument
@@ -469,6 +538,8 @@
                 (re-find regex (.getValue tag))))
           (seq (.getTags taggable)))))
 
+;; *TODO*: note that Filter values can have '*' and '?', as per
+;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
 ;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
 (defn describe-instances
   "Retrieve one or more Instances with various filters and regions applied.
