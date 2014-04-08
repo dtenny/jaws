@@ -343,19 +343,6 @@
 ;;; IAM
 ;;;
 
-;;user> (iam/create-access-key :user-name "dtenny")
-;;{:access-key {:secret-access-key "xd6ZKV2s1LfPsKGhDxgrXOj2Gqr4lJniQeQOpHrv", :status "Active", :access-key-id "AKIAJQ36WCPC57C5EPIA", :create-date #<DateTime 2014-03-18T14:20:56.799-05:00>, :user-name "dtenny"}}
-;;user> (iam/update-access-key :access-key-id "AKIAJQ36WCPC57C5EPIA" :status "Inactive")
-;;nil
-;;user> (iam/list-access-keys)
-;;{:access-key-metadata [{:status "Active", :access-key-id "AKIAJOGACDIRSSXI2YIQ", :create-date #<DateTime 2013-12-06T06:11:06.000-05:00>, :user-name "dtenny"} {:status "Inactive", :access-key-id "AKIAJQ36WCPC57C5EPIA", :create-date #<DateTime 2014-03-18T14:20:56.000-05:00>, :user-name "dtenny"}], :is-truncated false}
-;;user> (iam/delete-access-key :access-key-id "AKIAJQ36WCPC57C5EPIA")
-;;nil
-;;user> (iam/list-access-keys)
-;;{:access-key-metadata [{:status "Active", :access-key-id "AKIAJOGACDIRSSXI2YIQ", :create-date #<DateTime 2013-12-06T06:11:06.000-05:00>, :user-name "dtenny"}], :is-truncated false}
-;;user> (iam/get-user)
-;;{:user {:user-id "AIDAJDCYQGPATRJYSPFHG", :arn "arn:aws:iam::181951604100:user/dtenny", :create-date #<DateTime 2013-12-05T14:38:05.000-05:00>, :user-name "dtenny", :path "/"}}
-
 (defn get-user-name "Get the user-name of an iam user" []
   (get-in (iam/get-user) [:user :user-name]))
 

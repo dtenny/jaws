@@ -443,7 +443,7 @@
        (map (fn [mapping] (.getEbs mapping)))
        (map (fn [dev] (.getVolumeId dev)))))
 
-(defn- describeInstancesResult->instances
+(defn describeInstancesResult->instances
   "Convert DescribeInsancesResult objects to a sequence of instances.
    The argument may be a singleton DescribeInstancesResult or a collection of them."
   [results]
@@ -676,43 +676,6 @@
           (report-instances :data describeInstancesResult :exclude #{:VpcId}))))))
 
                      
-;;;
-;;; EC2 Scribe account specific
-;;;
-
-(defonce scribe-production-regions [:us-east-1 :eu-west-1 :us-west-2 :ap-southeast-1])
-(defonce scribe-preproduction-regions [:us-east-1 :eu-west-1])
-
-(defn scribe-production-instances
-  "Return a single DescribeInstanceResult for all production scribe servers in *region*."
-  []
-  (.describeInstances
-   (ec2)
-   (doto (DescribeInstancesRequest.)
-     (.setFilters 
-      [(Filter. "tag-value" (for [i (range 3)] (str "scribe-relay-" i)))]))))
-
-(defn scribe-all-production-instances
-  "Return a single DescribeInstanceResult for all production scribe servers in all regions."
-  []
-  (for [region scribe-production-regions]
-    (binding [*region* region] (scribe-production-instances))))
-
-(defn scribe-preproduction-instances
-  "Return a single DescribeInstanceResult for all pre-production scribe servers in *region*."
-  []
-  (.describeInstances
-   (ec2)
-   (doto (DescribeInstancesRequest.)
-     (.setFilters
-      [(Filter. "tag-value" (for [i (range 3)] (str "scribe-relay-preprod-" i)))]))))
-
-(defn scribe-all-preproduction-instances
-  "Return a collection of DescribeInstanceResults for all pre-production scribe servers in all regions."
-  []
-  (for [region scribe-preproduction-regions]
-    (binding [*region* region] (scribe-preproduction-instances))))
-
 ;;;
 ;;; EC2 Misc
 ;;;
