@@ -13,7 +13,8 @@
             CreateTagsRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
-            Filter Instance Tag TerminateInstancesRequest])
+            Filter Instance InstanceAttributeName
+            ModifyInstanceAttributeRequest Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import [com.amazonaws.services.identitymanagement.model
             GetInstanceProfileRequest GetRoleRequest])
@@ -552,6 +553,8 @@
 ;; *TODO*: note that Filter values can have '*' and '?', as per
 ;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
 ;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
+;; *TBD*: need filters of some kind (pre or post) that match any interesting field,
+;; not just tags. (userdata, description, instance name, sg names, etc)
 (defn describe-instances
   "Retrieve zero or more Instances with various filters and regions applied.
    Returns a collection that can be fed as :data to 'report-instances', e.g.
@@ -586,20 +589,28 @@
 
 (defn terminate-instances
   "Terminate one or more instances.
+   ids     a string instance ID or collection/sequence of same specifying specific instances
+           to be deleted.
    :region a region keyword from 'region-map' to override *region*.
-   ids a string instance ID or collection/sequence of same specifying specific instances
-        to be deleted."
-  [ids & {:keys [region]
+   :force  if true, ensure that we can disable the instance via termination APIs
+           (i.e cancel 'DisableApiTermination' status)."
+  [ids & {:keys [region force]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (doseq [instanceStateChange 
-          (->> (.terminateInstances (ec2 region)
-                                    (TerminateInstancesRequest. (listify ids)))
-               (.getTerminatingInstances))]
-    (println (.getInstanceId instanceStateChange)
-             (.getName (.getPreviousState instanceStateChange))
-             "=>"
-             (.getName (.getCurrentState instanceStateChange)))))
+  (let [ids (listify ids)]
+    (if force
+      (doseq [id ids]
+        (.modifyInstanceAttribute (ec2 region)
+         (doto (ModifyInstanceAttributeRequest.
+                id InstanceAttributeName/DisableApiTermination)
+           (.setValue "false")))))
+    (doseq [instanceStateChange 
+            (->> (.terminateInstances (ec2 region) (TerminateInstancesRequest. ids))
+                 (.getTerminatingInstances))]
+      (println (.getInstanceId instanceStateChange)
+               (.getName (.getPreviousState instanceStateChange))
+               "=>"
+               (.getName (.getCurrentState instanceStateChange))))))
 
 ;;;
 ;;; EC2 Security groups
@@ -732,6 +743,10 @@
         (apply (partial merge-with union)
                (map (fn [asid] {(.getAutoScalingGroupName asid) #{(.getLaunchConfigurationName asid)}})
                     autoScalingInstanceDetails))
+        lc-names->as-group-names
+        (apply (partial merge-with union)
+               (map (fn [asid] {(.getLaunchConfigurationName asid) #{(.getAutoScalingGroupName asid)}})
+                    autoScalingInstanceDetails))
         lc-names->instance-ids
         (apply (partial merge-with union)
                (map (fn [asid] {(.getLaunchConfigurationName asid) #{(.getInstanceId asid)}})
@@ -742,12 +757,16 @@
                     autoScalingInstanceDetails))
         ri (fn [ids]
              (report-instances :ids ids :indent 4 :include #{:PrivateIpAddress}
-                               :split-after :InstanceType))]
-    (doseq [group (describe-auto-scaling-groups)]
+                               :split-after :InstanceType))
+        auto-scaling-groups (describe-auto-scaling-groups)]
+    (doseq [group auto-scaling-groups]
       (let [as-group-name (.getAutoScalingGroupName group)]
         (println "AutoScalingGroup:" as-group-name)
         (doseq [launch-config-name (get asgroupnames->lc-names as-group-name)]
-          (println "  Launch Configuration:" launch-config-name)
+          (print "  Launch Configuration:" launch-config-name)
+          (if (= launch-config-name (.getLaunchConfigurationName group))
+            (println "  [Active]")
+            (println "  [INACTIVE]"))
           ;; Intersect LC->instances with ASG->instances in case they don't map 1:1
           (ri (intersection
                (into #{} (get lc-names->instance-ids launch-config-name))
@@ -758,10 +777,34 @@
               ids-without-lc-key (filter (fn [id] (not (get instance-ids->lc-names id)))
                                          instance-ids)]
           (when (not-empty? ids-without-lc-key)
-            (println "  ** ASG instances not in the above launch configurations. **")
-            (ri ids-without-lc-key))))
-      ;; *FINISH* ; lc dump?
-      )))
+            (println)
+            (println "  ** AutoScalingGroup instances not in the above Launch Configurations. **")
+            (ri ids-without-lc-key)))))
+
+    ;; Print out any launch configs not mentioned as part of auto scaling groups above
+    (let [all-launch-configurations (.getLaunchConfigurations (.describeLaunchConfigurations (asc)))
+          lc-names-not-in-as-groups
+          (filter (fn [lcname] (not (get lc-names->as-group-names lcname)))
+                  (map #(.getLaunchConfigurationName %) all-launch-configurations))]
+      (unless (empty? lc-names-not-in-as-groups)
+              (println)
+              ;; Unless the LC was created after we queried the ASG's above, a timing hole
+              (println "** Unused Launch Configurations **")
+              (let [lc-name->launch-configurations
+                    ;; This is in case there are multiple orphaned launch configurations with the same name,
+                    ;; hopefully that's not possible, but only Amazon knows.
+                    (apply (partial merge-with concat)
+                           (map (fn [lc] {(.getLaunchConfigurationName lc) [lc]})
+                                all-launch-configurations))]
+                (doseq [lc-name lc-names-not-in-as-groups]
+                  (doseq [lc (get lc-name->launch-configurations lc-name)]
+                    (println " " lc-name " created:" (str (.getCreatedTime lc)))
+                    (println "   " (.getLaunchConfigurationARN lc))
+                    (println "    ImageId:" (.getImageId lc) " HasPublicIP:" (.getAssociatePublicIpAddress lc))
+                    (println "    InstanceProfile:" (.getIamInstanceProfile lc) " KeyPairName:" (.getKeyName lc)
+                             " InstanceType:" (.getInstanceType lc))
+                    (println "    SecurityGroups:" (seq (.getSecurityGroups lc))))))))))
+
 
                      
 ;;;
