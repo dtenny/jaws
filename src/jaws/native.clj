@@ -7,6 +7,7 @@
   (:use [clojure.tools.logging :exclude [trace]])
   (:import [com.amazonaws.auth BasicAWSCredentials])
   (:import [com.amazonaws.regions Regions Region])
+  (:import [com.amazonaws.services.autoscaling AmazonAutoScalingClient])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             CreateTagsRequest
@@ -374,6 +375,18 @@
 (defmethod instance-state Instance [instance]
   (get instance-state-code-map (.getCode (.getState instance)) :unknown-state-code))
 
+(defmulti  instance-public-dns-name
+  "Retrieve the public dns name for an instance or instance id,
+   return nil if there isn't one.  Note that this information isn't available at all
+   until the instance is in the :running state, and maybe not even then for VPC instances."
+  class)
+(defmethod instance-public-dns-name String [instance-id]
+  (instance-public-dns-name (first (describe-instances :ids instance-id))))
+(defmethod instance-public-dns-name Instance [instance]
+  (let [dns-name (.getPublicDnsName instance)]
+    (and (> (count dns-name) 0)
+         dns-name)))
+
 (defn- sort-aws-tags
   "Given a sequence of Tags, 
    sort them lexicographically by key and value names unless there is a supplied
@@ -402,36 +415,8 @@
   "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
    E.g. [Name=this is a tag description, ...]"
   [tag-list]
-  (mapv (fn [tag] (str (.getKey tag) "='" (.getValue tag) "'"))
+  (mapv (fn [tag] (str (.getKey tag) "=" (.getValue tag)))
         (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
-
-;; *TODO*: put this in jdt.core
-(defn seqify
-  "If x is a singleton datum, return some kind of sequence of one element, x.
-   If x is a collection return a sequence for it.
-   If x is a sequence, return it as is.
-   Nil is given special treatment and is turned into an empty sequence,
-   however false is nto converted into an empty sequence."
-  [x]
-  (cond (seq? x) x
-        (coll? x) (seq x)
-        (nil? x) ()
-        :else (list x)))
-
-;; *TODO*: put this in jdt.core
-(defn listify
-  "Similar to seqify, but ensures that the returned collection type is a List.
-   If x is a singleton datum, return a list of one element, x.
-   If x is a non-list collection return a list for it.
-   If x is a sequence, return it as a list.
-   Nil is given special treatment and is turned into an empty list
-   however false is not converted into an empty sequence."
-  [x]
-  (cond (list? x) x
-        (seq? x) (into () x)
-        (coll? x) (into () x)
-        (nil? x) ()
-        :else (list x)))
 
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object.
@@ -454,6 +439,15 @@
        (map (fn [reservation] (seq (.getInstances reservation))))
        flatten))
 
+;; *TODO*: put in jdt.core
+(defn empty-string-alternative
+  "If string is not a string (e.g. nil) or is an empty string, return alternative, otherwise return string."
+  [string alternative]
+  (or (and (string? string) (> (count string) 0) string)
+      alternative))
+
+;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
+;; but this is only available via an DescribeAutoScalingInstancesResult.
 (defn report-instances 
   "Print a information about instances.
    The default is to print one line of information per instance, unless options
@@ -479,14 +473,20 @@
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
-           Defaults to: #{:ImageId :SubnetId :PublicDnsName :State :InstanceType :Tags}
-           Additional options include: :VolumeIds, :InstanceProfile.
+           Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :SecurityGroups :Tags}
+           Additional fields include: :VolumeIds, :InstanceProfile,
+           :PrivateIpAddress :PrivateDnsName :PublicIpAddress.
    :include Set of additional fields to display, defaults to #{}
    :exclude Set of fields to exclude from the display, defaults to #{}.
+   :split-after A field keyword, or collection of field keywords, after which a 'println' and indent
+                will occur to break the report into multiple lines per instance.
+                By default there is only one line per instance for easier output grepping.
+                Rather pointless if you use the last field as a split field, unless you want a blank line
+                between each instance' report.  JDT likes :InstanceType for this keyword.
    Note that presently you can't specify the order of fields."
-  [& {:keys [data instances ids vpc-mode region indent indent-incr fields include exclude]
+  [& {:keys [data instances ids vpc-mode region indent indent-incr fields include exclude split-after]
       :or {indent *indent* indent-incr 2
-           fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :Tags}
+           fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :SecurityGroups :Tags}
            include #{} exclude #{} }}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [instances1 (and data (describeInstancesResult->instances data))
@@ -499,30 +499,41 @@
                              (regions-for-key region)))
                        instances3)
         fields (difference (union fields include) exclude)
-        ps (fn [x] (print x) (print " "))
-        pa (fn [x] (pr x) (print " "))]
+        split-after (into #{} (seqify split-after))
+        sp (fn [x] (when (split-after x)
+                     (println)
+                     (do-indent(+ indent indent-incr))))     ;split if necessary
+        ps (fn [x] (print x) (print " ")) ;print unquoted
+        pa (fn [x] (pr x) (print " "))    ;print quoted
+        xpr (fn [key val printfn]         ;print and maybe split
+              (when (get fields key)
+                (printfn val)
+                (sp key)))]
     (doseq [instance instances4]
-      (do-indent)
+      (do-indent indent)
       (ps (.getInstanceId instance))
-      ;; Macro anyone, for the following?
-      (if (:ImageId fields) (ps (.getImageId instance)))
-      (if (:VpcId fields) (ps (or (.getVpcId instance) "<noVpc>")))
-      (if (:SubnetId fields) (ps (or (.getSubnetId instance) "<noSubnet>")))
-      (if (:PublicDnsName fields)
-        (let [name (.getPublicDnsName instance)]
-          (ps (or (and name (> (count name) 0) name)
-                  "<noPublicDns>"))))
-      (if (:State fields) (ps (.getName (.getState instance))))
-      (if (:InstanceType fields) (ps (.getInstanceType instance)))
-      (if (:InstanceProfile fields) (ps (.getArn (.getIamInstanceProfile instance))))
-      (if (:Tags fields) (pa (squish-tags (.getTags instance))))
-      (if (:VolumeIds fields) (ps (instance-volume-ids instance)))
+      ;; Convert to pure iteration on fields and reflection call? 
+      ;; Also note that xpr as function forces value valuation where as
+      ;; xpr as macro could avoid evaluating all these reflective calls
+      ;; even if we don't print them.
+      (xpr :ImageId (.getImageId instance) ps)
+      (xpr :VpcId (or (.getVpcId instance) "<noVpc>") ps)
+      (xpr :SubnetId (or (.getSubnetId instance) "<noSubnet>") ps)
+      (xpr :PublicDnsName (empty-string-alternative (.getPublicDnsName instance) "<noPublicDns>") ps)
+      (xpr :PublicIpAddress (.getPublicIpAddress instance) ps)
+      (xpr :PrivateDnsName (empty-string-alternative (.getPrivateDnsName instance) "<noPrivateDns>") ps)
+      (xpr :PrivateIpAddress (.getPrivateIpAddress instance) ps)
+      (xpr :State (.getName (.getState instance)) ps)
+      (xpr :InstanceType (.getInstanceType instance) ps)
+      (xpr :InstanceProfile
+           (if-let [ip (.getIamInstanceProfile instance)]
+             (.getArn ip)
+             "<noInstanceProfile>")
+           ps)
+      (xpr :SecurityGroups (map #(.getGroupName %) (.getSecurityGroups instance)) ps)
+      (xpr :Tags (squish-tags (.getTags instance)) pa)
+      (xpr :VolumeIds (instance-volume-ids instance) ps)
       (println))))
-
-;;; *TODO*: put this in jdt.core
-(defn always-nil "A function that always returns nil."
-  [& args]
-  nil)
 
 (defn- tag-regex-find-fn 
   "Return a function of one argument that takes calls .getTags on the argument
@@ -542,7 +553,7 @@
 ;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
 ;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
 (defn describe-instances
-  "Retrieve one or more Instances with various filters and regions applied.
+  "Retrieve zero or more Instances with various filters and regions applied.
    Returns a collection that can be fed as :data to 'report-instances', e.g.
    (report-instances :instances (describe-instances :tag-regex #\"(?i)created\"))
    Options:
@@ -557,12 +568,14 @@
   [& {:keys [region tag-regex ids]}]
   (let [regions (regions-for-key region)
         fetch-fn (if ids
-                   (fn [region] (.describeInstances (ec2 region)
-                                                    (doto (DescribeInstancesRequest.)
-                                                      (.setInstanceIds (seqify ids)))))
+                   (if (> (count ids) 0)
+                     (fn [region] (.describeInstances (ec2 region)
+                                                      (doto (DescribeInstancesRequest.)
+                                                        (.setInstanceIds (seqify ids)))))
+                     (constantly nil))
                    (fn [region] (.describeInstances (ec2 region))))
         tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
-    (->> (map fetch-fn regions)
+    (->> (filter identity (map fetch-fn regions)) ;filter nils
          flatten
          (map (fn [descInsRes] (seq (.getReservations descInsRes))))
          flatten
@@ -612,7 +625,7 @@
                     (squish-tags (.getTags sg))
                     (.getDescription sg))))))
 
-
+
 ;;;
 ;;; EC2 VPC
 ;;;
@@ -674,8 +687,83 @@
                    (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (binding [*indent* (+ *indent* 4)]
           (report-instances :data describeInstancesResult :exclude #{:VpcId}))))))
+
+;;;
+;;; Auto-scaling stuff
+;;;
 
-                     
+;;; NOTE: while an auto-scaling-group has one currently associated launch config,
+;;; it may have instances running associated with "old" launch configs that are not longer the current one for the
+;;; ASG (look at the ASG instances, and the launch configs of those instances, and you'll see the launch configs that aren't the
+;;; current ASG LC.)
+
+(defn ^AmazonAutoScalingClient asc
+  "Return an AmazonAutoScalingCLient instance ready for calls for a single (optional) region.
+   'region' is a keyword defaulting to *region*."
+  ([] (asc *region*))
+  ([region]
+     (let [asc (AmazonAutoScalingClient. (make-aws-creds))
+           region (if (instance? Region region) region (get-valid region-map region))]
+       (.setRegion asc region)
+       asc)))
+
+(defn describe-auto-scaling-groups []
+  "Return a list of AutoScalingGroup instances.  *TBD* Not sure what to do with tokens. and possibly incomplete results."
+  (.getAutoScalingGroups (.describeAutoScalingGroups (asc))))
+  
+(defn report-auto-scaling-groups []
+  "Print one line summary of AutoScalingGroup instances.
+   *TODO*: There's a lot of useful data here we don't report on right now."
+  (doseq [group (describe-auto-scaling-groups)]
+    (println (.getAutoScalingGroupName group)
+             "LC:" (.getLaunchConfigurationName group)
+             "LBs:" (seq (.getLoadBalancerNames group))
+             "VpcZid:" (.getVPCZoneIdentifier group)
+             "Status:" (.getStatus group)
+             (map #(.getInstanceId %) (.getInstances group))
+             "Susp:" (map #(.getProcessName %) (.getSuspendedProcesses group))
+             (squish-tags (.getTags group)))))
+
+(defn dump-auto-scaling-groups []
+  "Print a hierarchical report of auto-scaling groups, their instances, launch configurations, etc."
+  ;; Get a map of instance->launch config data
+  (let [autoScalingInstanceDetails (.getAutoScalingInstances (.describeAutoScalingInstances (asc)))
+        asgroupnames->lc-names
+        (apply (partial merge-with union)
+               (map (fn [asid] {(.getAutoScalingGroupName asid) #{(.getLaunchConfigurationName asid)}})
+                    autoScalingInstanceDetails))
+        lc-names->instance-ids
+        (apply (partial merge-with union)
+               (map (fn [asid] {(.getLaunchConfigurationName asid) #{(.getInstanceId asid)}})
+                    autoScalingInstanceDetails))
+        instance-ids->lc-names
+        (apply (partial merge-with union)
+               (map (fn [asid] {(.getInstanceId asid) #{(.getLaunchConfigurationName asid)}})
+                    autoScalingInstanceDetails))
+        ri (fn [ids]
+             (report-instances :ids ids :indent 4 :include #{:PrivateIpAddress}
+                               :split-after :InstanceType))]
+    (doseq [group (describe-auto-scaling-groups)]
+      (let [as-group-name (.getAutoScalingGroupName group)]
+        (println "AutoScalingGroup:" as-group-name)
+        (doseq [launch-config-name (get asgroupnames->lc-names as-group-name)]
+          (println "  Launch Configuration:" launch-config-name)
+          ;; Intersect LC->instances with ASG->instances in case they don't map 1:1
+          (ri (intersection
+               (into #{} (get lc-names->instance-ids launch-config-name))
+               (into #{} (map #(.getInstanceId %) (.getInstances group))))))
+        ;; Paranoid: check for asg reported instances not in above launch configurations
+        (let [asg-instances (.getInstances group)
+              instance-ids (map #(.getInstanceId %) asg-instances)
+              ids-without-lc-key (filter (fn [id] (not (get instance-ids->lc-names id)))
+                                         instance-ids)]
+          (when (not-empty? ids-without-lc-key)
+            (println "  ** ASG instances not in the above launch configurations. **")
+            (ri ids-without-lc-key))))
+      ;; *FINISH* ; lc dump?
+      )))
+
+                     
 ;;;
 ;;; EC2 Misc
 ;;;
