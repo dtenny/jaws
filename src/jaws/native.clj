@@ -17,7 +17,8 @@
             ModifyInstanceAttributeRequest Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import [com.amazonaws.services.identitymanagement.model
-            GetInstanceProfileRequest GetRoleRequest])
+            GetInstanceProfileRequest GetRolePolicyRequest GetRoleRequest
+            ListRolePoliciesRequest])
   (:import java.io.File))
 
 ;;;
@@ -244,16 +245,53 @@
     true
     (catch Exception e false)))
 
-(defn instance-profile-name-exists?
-  "Return true if the specified IAM Instance Profile name exists, false otherwise.
-   'name' refers to the user name, not the ARN."
+(defn get-instance-profile
+  "Return an InstanceProfile object if the indicated name exists, nil if it does not
+   exist."
   [ip-name]
   (try
-    (.getInstanceProfile (iam)
-                         (doto (GetInstanceProfileRequest.)
-                           (.setInstanceProfileName ip-name)))
-    true
-    (catch Exception e false)))
+    (.getInstanceProfile
+     (.getInstanceProfile (iam)
+                          (doto (GetInstanceProfileRequest.)
+                            (.setInstanceProfileName ip-name))))
+    (catch Exception e nil)))
+
+(defn get-role-policy-names
+  "Retrieve all role policy names for the specified role-name, or nil if
+   there aren't any.
+   *TBD* May or may not need a catch block inserted for invalid role names."
+  [role-name]
+  (.getPolicyNames
+   (.listRolePolicies
+    (iam) (doto (ListRolePoliciesRequest.)
+            (.setRoleName role-name)))))
+    
+(defn get-role-policy-documents
+  "Retrieve all role policy documents for the specified role-name, or nil if there
+   aren't any.
+   *TBD* May or may not need a catch block inserted for invalid role names."
+  [role-name]
+  (map (fn [policy-name]
+         ;; Note that this decodes application/x-www-form-urlencoded MIME format, 
+         ;; not true RFC3986 format. It differs on only an escape or two, I suspect.
+         (java.net.URLDecoder/decode 
+          (.getPolicyDocument
+           (.getRolePolicy
+            (iam) (doto (GetRolePolicyRequest.)
+                    (.setPolicyName policy-name)
+                    (.setRoleName role-name)))) "UTF-8"))
+       (get-role-policy-names role-name)))
+
+(defn get-instance-profile-policy-documents
+  "Retrieve all policy documents for all roles associated with an instance profile.
+   Throw an exception if the instance profile name is invalid.
+   Name should not be the ARN, but the general user name."
+  [ip-name]
+  (if-let [instanceProfile (get-instance-profile ip-name)]
+    (flatten
+     (map (fn [role] (get-role-policy-documents (.getRoleName role)))
+          (.getRoles instanceProfile)))
+    (throw (Exception. (str "InstanceProfile name '" ip-name "' does not exist.")))))
 
 (defn report-roles
   []
@@ -474,7 +512,7 @@
            iff :data is unspecified, data will be fetched from all regions.
            :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
-           Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :SecurityGroups :Tags}
+           Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
            Additional fields include: :VolumeIds, :InstanceProfile,
            :PrivateIpAddress :PrivateDnsName :PublicIpAddress.
    :include Set of additional fields to display, defaults to #{}
@@ -487,7 +525,7 @@
    Note that presently you can't specify the order of fields."
   [& {:keys [data instances ids vpc-mode region indent indent-incr fields include exclude split-after]
       :or {indent *indent* indent-incr 2
-           fields #{:ImageId :VpcId :SubnetId :PublicDnsName :State :InstanceType :SecurityGroups :Tags}
+           fields #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
            include #{} exclude #{} }}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [instances1 (and data (describeInstancesResult->instances data))
@@ -524,6 +562,7 @@
       (xpr :PublicIpAddress (.getPublicIpAddress instance) ps)
       (xpr :PrivateDnsName (empty-string-alternative (.getPrivateDnsName instance) "<noPrivateDns>") ps)
       (xpr :PrivateIpAddress (.getPrivateIpAddress instance) ps)
+      (xpr :KeyName (.getKeyName instance) ps)
       (xpr :State (.getName (.getState instance)) ps)
       (xpr :InstanceType (.getInstanceType instance) ps)
       (xpr :InstanceProfile
