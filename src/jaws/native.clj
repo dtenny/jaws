@@ -14,7 +14,7 @@
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance InstanceAttributeName
-            ModifyInstanceAttributeRequest Tag TerminateInstancesRequest])
+            ModifyInstanceAttributeRequest StopInstancesRequest Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import [com.amazonaws.services.identitymanagement.model
             GetInstanceProfileRequest GetRolePolicyRequest GetRoleRequest
@@ -407,12 +407,47 @@
   {0 :pending, 16 :running, 32 :shutting-down, 48 :terminated, 64 :stopping, 80 :stopped})
 
 (defmulti  instance-state
-    "Retrieve instance state for an EC2 instance as a keyword, e.g. :running"
+    "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
+     Note that an instance-id will cause a refetch of state, while an Instance
+     object merely decodes the state already in memory (which will not change
+     across successfive calls)."
     class)
 (defmethod instance-state String [instance-id]
   (instance-state (first (describe-instances :ids instance-id))))
 (defmethod instance-state Instance [instance]
   (get instance-state-code-map (.getCode (.getState instance)) :unknown-state-code))
+
+(defmulti  wait-for-instance-state
+  "Wait for an instance to reach the designated instance state.
+
+   Instance may be an instance or instance ID.
+   State should be one of :running :terminated or :stopped
+    (and not one of the transient states).
+
+   Note that state is re-fetched for the instance call until the target
+   state is reached.
+
+   Optional keyword args include:
+   :verbose - print a 'waiting for <id> to enter the <y> state' message with a dot
+              every 5 seconds.
+   Returns nil."
+  (fn [& args] (class (first args))))
+(defmethod wait-for-instance-state Instance [instance state & args]
+  (wait-for-instance-state (.getInstanceId instance) state))
+(defmethod wait-for-instance-state String [instance-id state & {:keys [verbose]}]
+  {:pre [(get #{:running :terminated :stopped} state)]}
+  (when verbose
+    (let [initial-state (instance-state instance-id)]
+      (if-not (= initial-state state)
+        (println "Waiting for" initial-state "instance" instance-id "to enter the" state "state"))))
+  (while (not= (instance-state instance-id) state)
+    (Thread/sleep 5000)
+    (if verbose
+      (do (print ".") (flush))))
+  (if verbose
+    (println)))
+  
+
 
 (defmulti  instance-public-dns-name
   "Retrieve the public dns name for an instance or instance id,
@@ -626,6 +661,28 @@
          (filter tag-regex-fn)
          )))
 
+(defn stop-instances
+  "Stop one or more isntances, waiting if requested.
+   ids     a string instance ID or collection/sequence of same specifying specific instances
+           to be deleted.
+   :wait   true if this function should not exit until all instances have stopped.
+   :region a region keyword from 'region-map' to override *region*."
+  [ids & {:keys [region wait]
+          :or {region *region*}}]
+  {:pre [(not (= region :all))]}
+  (let [ids (listify ids)]
+    (doseq [instanceStateChange 
+            (->> (.stopInstances (ec2 region) (StopInstancesRequest. ids))
+                 (.getStoppingInstances))]
+      (println (.getInstanceId instanceStateChange)
+               (.getName (.getPreviousState instanceStateChange))
+               "=>"
+               (.getName (.getCurrentState instanceStateChange))))
+    (if wait
+      (doseq [id ids]
+        (wait-for-instance-state id :stopped :verbose true)))))
+
+;; *TODO*: Add a :wait keyword like we did for stop-instances
 (defn terminate-instances
   "Terminate one or more instances.
    ids     a string instance ID or collection/sequence of same specifying specific instances
