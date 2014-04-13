@@ -327,16 +327,6 @@
 ;;; EC2 - General
 ;;;
 
-;;; *TODO*: move to jdt.core
-(defn get-valid
-  "Return the value of (get map key). If key is not in map,
-   throw an IllegalArgumentException."
-  [map key]
-  (let [result (get map key get-valid)]
-    (if (= result get-valid)
-      (throw (IllegalArgumentException. (str "No such key " key " in map.")))
-      result)))
-
 (defn ^AmazonEC2Client ec2
   "Return an AmazonEC2Client instance ready for calls for a single (optional) region.
    'region' is a keyword defaulting to *region*."
@@ -512,13 +502,6 @@
        flatten
        (map (fn [reservation] (seq (.getInstances reservation))))
        flatten))
-
-;; *TODO*: put in jdt.core
-(defn empty-string-alternative
-  "If string is not a string (e.g. nil) or is an empty string, return alternative, otherwise return string."
-  [string alternative]
-  (or (and (string? string) (> (count string) 0) string)
-      alternative))
 
 ;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
 ;; but this is only available via an DescribeAutoScalingInstancesResult.
