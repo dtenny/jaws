@@ -8,6 +8,9 @@
   (:import [com.amazonaws.auth BasicAWSCredentials])
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.autoscaling AmazonAutoScalingClient])
+  (:import [com.amazonaws.services.cloudwatch AmazonCloudWatchClient])
+  (:import [com.amazonaws.services.cloudwatch.model
+            DescribeAlarmsRequest])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             CreateTagsRequest
@@ -531,7 +534,7 @@
            :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
            Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
-           Additional fields include: :VolumeIds, :InstanceProfile,
+           Additional fields include: :VolumeIds, :InstanceProfile, :LaunchTime,
            :PrivateIpAddress :PrivateDnsName :PublicIpAddress.
    :include Set of additional fields to display, defaults to #{}
    :exclude Set of fields to exclude from the display, defaults to #{}.
@@ -582,6 +585,7 @@
       (xpr :PrivateIpAddress (.getPrivateIpAddress instance) ps)
       (xpr :KeyName (.getKeyName instance) ps)
       (xpr :State (.getName (.getState instance)) ps)
+      (xpr :LaunchTime (str (.getLaunchTime instance)) ps)
       (xpr :InstanceType (.getInstanceType instance) ps)
       (xpr :InstanceProfile
            (if-let [ip (.getIamInstanceProfile instance)]
@@ -607,8 +611,10 @@
                 (re-find regex (.getValue tag))))
           (seq (.getTags taggable)))))
 
-;; *TODO*: note that Filter values can have '*' and '?', as per
+;; *TODO*: note that Filter _values_ can have '*' (zero or more chars) and '?' (one or more chars), as per
 ;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
+;; Filter value matching is case sensitive (hence pretty limited, particularly since there's no disjunction).
+;; Note: wildcard and baskslash chars must be escaped with backslashes.
 ;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
 ;; *TBD*: need filters of some kind (pre or post) that match any interesting field,
 ;; not just tags. (userdata, description, instance name, sg names, etc)
@@ -946,3 +952,88 @@
   (doseq [keyPairInfo (.getKeyPairs (.describeKeyPairs (ec2)))]
     (println (.getKeyName keyPairInfo)
              (.getKeyFingerprint keyPairInfo))))
+
+
+;;;
+;;; Cloudwatch
+;;;
+
+(defn ^AmazonCloudWatchClient cw
+  "Return an AmazonCloudWatchClient instance ready for calls for a single (optional) region.
+   'region' is a keyword defaulting to *region*."
+  ([] (cw *region*))
+  ([region]
+     (let [cw (AmazonCloudWatchClient. (make-aws-creds))
+           region (if (instance? Region region) region (get-valid region-map region))]
+       (.setRegion cw region)
+       cw)))
+
+;; (take 125 (describe-alarms-nonlazy)) - verify # batches fetched
+(defn- get-alarms-nonlazy
+  "Fetch all alarms in paged fashion, as a non-lazy sequence.
+   'cw' is an AmazonCloudWatchClient instance."
+  [cw]
+  (let [alarm-result (.describeAlarms cw (doto (DescribeAlarmsRequest.)
+                                          (.setMaxRecords (int 100))))];defaults to 50
+    (loop [result (.getMetricAlarms alarm-result) nt (.getNextToken alarm-result)]
+      ;;(println "nt=" (str "'" nt "'") "cnt=" (count result))
+      (if (and nt (> (count nt) 0))
+        (let [alarm-result (.describeAlarms
+                            cw (doto (DescribeAlarmsRequest.)
+                                 (.setMaxRecords (int 100))
+                                 (.setNextToken nt)))]
+          (recur (concat result (.getMetricAlarms alarm-result))
+                 (.getNextToken alarm-result)))
+        result))))
+                                                    
+;; (take 125 (describe-alarms-lazy)), verify # batches fetched
+(defn- get-alarms-lazy
+  "Fetch all alarms in paged fashion, as a lazy sequence.
+   'cw' is an AmazonCloudWatchClient instance.
+   'result' is the seq of MetricAlarms gathered so far.
+   'nt' is the nextToken to fetch."
+  [cw result nt]
+  ;;(println "nt=" (str "'" nt "'") "cnt=" (count result))
+  (if (and nt (> (count nt) 0))
+    (concat result
+            (lazy-seq 
+             (let [alarm-result (.describeAlarms
+                                 cw (doto (DescribeAlarmsRequest.)
+                                      (.setMaxRecords (int 100))
+                                      (.setNextToken nt)))]
+               (get-alarms-lazy cw (.getMetricAlarms alarm-result)
+                                (.getNextToken alarm-result)))))
+    result))
+
+(defn describe-alarms-nonlazy
+  "Retrieve a non-lazy sequence of zero or more MetricAlarm instances.
+   i.e. (take 10 (describe-alarms-nonlazy)) will still fetch all alarms."
+  []
+  (get-alarms-nonlazy (cw)))
+
+(defn describe-alarms-lazy
+  "Retrieve a lazy sequence of zero or more MetricAlarm instances.
+   i.e. (take 10 (describe-alarms-nonlazy)) will NOT fetch all alarms, just the first
+   'batch' (whose size may wish to optimize but is limited to 100 max)."
+  []
+  (let [cw (cw)
+        alarm-result (.describeAlarms cw (doto (DescribeAlarmsRequest.)
+                                           (.setMaxRecords (int 100))))]; defaults to 50
+    (get-alarms-lazy cw (.getMetricAlarms alarm-result) (.getNextToken alarm-result))))
+
+(defn report-alarms
+  "Report on zero or more MetricAlarm instances, fetch them if none are specified as with 'describe-alarms'.
+  :instances A collectionof MetricAlarm instances, optional."
+  [& {:keys [instances]}]
+  ;; Note: non-lazy took 17.4 secs, lazy took 18.3 secs, for 1761 alarms
+  ;; in 50 record batches (the default).  Could be normal statistical/network variance.
+  ;; With 100 record batches: non-lazy 14.47 secs, lazy 14.74 secs
+  (let [instances (or instances (describe-alarms-nonlazy))]
+    (doseq [ma instances]               ;ma == metricAlarm
+      (println (.getAlarmName ma)
+               (.getMetricName ma)
+               (.getAlarmDescription ma)))))
+      
+
+  
+  
