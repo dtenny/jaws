@@ -14,6 +14,7 @@
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             CreateImageRequest CreateTagsRequest
+            DeleteSnapshotRequest DeregisterImageRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance InstanceAttributeName
@@ -506,6 +507,16 @@
        (map (fn [reservation] (seq (.getInstances reservation))))
        flatten))
 
+;; Some stupid report printing functions & macros
+(defn- pu "print unquoted/friendly, ie. ~a" [x] (print x) (print " "))
+(defn- pq "print quoted/readable, ie. ~s" [x] (pr x) (print " "))
+(defmacro pif
+  "print val using print-fn if test is true, avoid computing val more than once"
+  [test val print-fn]
+  `(if ~test
+     (let [val# ~val]
+       (~print-fn val#))))
+
 ;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
 ;; but this is only available via an DescribeAutoScalingInstancesResult.
 (defn report-instances 
@@ -563,38 +574,36 @@
         sp (fn [x] (when (split-after x)
                      (println)
                      (do-indent(+ indent indent-incr))))     ;split if necessary
-        ps (fn [x] (print x) (print " ")) ;print unquoted
-        pa (fn [x] (pr x) (print " "))    ;print quoted
-        xpr (fn [key val printfn]         ;print and maybe split
+        xpr (fn [key val printfn]         ;print and maybe split, use 'pif' or similar?
               (when (get fields key)
                 (printfn val)
                 (sp key)))]
     (doseq [instance instances4]
       (do-indent indent)
-      (ps (.getInstanceId instance))
+      (pu (.getInstanceId instance))
       ;; Convert to pure iteration on fields and reflection call? 
       ;; Also note that xpr as function forces value valuation where as
       ;; xpr as macro could avoid evaluating all these reflective calls
       ;; even if we don't print them.
-      (xpr :ImageId (.getImageId instance) ps)
-      (xpr :VpcId (or (.getVpcId instance) "<noVpc>") ps)
-      (xpr :SubnetId (or (.getSubnetId instance) "<noSubnet>") ps)
-      (xpr :PublicDnsName (empty-string-alternative (.getPublicDnsName instance) "<noPublicDns>") ps)
-      (xpr :PublicIpAddress (.getPublicIpAddress instance) ps)
-      (xpr :PrivateDnsName (empty-string-alternative (.getPrivateDnsName instance) "<noPrivateDns>") ps)
-      (xpr :PrivateIpAddress (.getPrivateIpAddress instance) ps)
-      (xpr :KeyName (.getKeyName instance) ps)
-      (xpr :State (.getName (.getState instance)) ps)
-      (xpr :LaunchTime (str (.getLaunchTime instance)) ps)
-      (xpr :InstanceType (.getInstanceType instance) ps)
+      (xpr :ImageId (.getImageId instance) pu)
+      (xpr :VpcId (or (.getVpcId instance) "<noVpc>") pu)
+      (xpr :SubnetId (or (.getSubnetId instance) "<noSubnet>") pu)
+      (xpr :PublicDnsName (empty-string-alternative (.getPublicDnsName instance) "<noPublicDns>") pu)
+      (xpr :PublicIpAddress (.getPublicIpAddress instance) pu)
+      (xpr :PrivateDnsName (empty-string-alternative (.getPrivateDnsName instance) "<noPrivateDns>") pu)
+      (xpr :PrivateIpAddress (.getPrivateIpAddress instance) pu)
+      (xpr :KeyName (.getKeyName instance) pu)
+      (xpr :State (.getName (.getState instance)) pu)
+      (xpr :LaunchTime (str (.getLaunchTime instance)) pu)
+      (xpr :InstanceType (.getInstanceType instance) pu)
       (xpr :InstanceProfile
            (if-let [ip (.getIamInstanceProfile instance)]
              (.getArn ip)
              "<noInstanceProfile>")
-           ps)
-      (xpr :SecurityGroups (map #(.getGroupName %) (.getSecurityGroups instance)) ps)
-      (xpr :Tags (squish-tags (.getTags instance)) pa)
-      (xpr :VolumeIds (instance-volume-ids instance) ps)
+           pu)
+      (xpr :SecurityGroups (map #(.getGroupName %) (.getSecurityGroups instance)) pu)
+      (xpr :Tags (squish-tags (.getTags instance)) pq)
+      (xpr :VolumeIds (instance-volume-ids instance) pu)
       (println))))
 
 (defn- tag-regex-find-fn 
@@ -931,33 +940,96 @@
       #_ (doseq [image images] (println (str image))) ; /tmp/native-images
       )))
           
+(defn keys-n-stuff->strings [seq]
+  (map (fn [thing]
+         (cond (keyword? thing) (name thing)
+               (string? thing) thing
+               :else (str thing)))
+       seq))
+
 (defn describe-images
   "Return a list of Image objects.  Beware calling this without IDs or other filters.
    Options:
-   :ids - an image id or seq of image ids"
-  [& {:keys [ids]}]
+   :ids - an image id or seq of image ids.
+   :owned-by - Can be one of the following, or a list of the following:
+               :self or \"self\", return only images owned by self, where self is the sender of the request,
+               :all or \"all\",
+               a string or number specifying an aws account ID.
+   :exec-by - Return only images executable by the value of this arg because of explicit launch permissions
+              Can be one of the following, or a list of the following:
+              :self or \"self\", where self is the sender of the request,
+              :all or \"all\",
+              or a string or numeric AWS account ID."
+  ;; *TODO: Filters
+  [& {:keys [ids owned-by exec-by]}]
   (let [request (DescribeImagesRequest.)]
     (if ids (.setImageIds request (listify ids)))
-    (.getImages (.describeImages (ec2) request))))
+    (if owned-by (.setOwners request (keys-n-stuff->strings (listify owned-by))))
+    (if exec-by (.setExecutableUsers request (keys-n-stuff->strings (listify exec-by))))
+    (seq (.getImages (.describeImages (ec2) request)))))
 
 (defn report-images
-  "Report on zero or more Image instances, fetch them if none are specified as with 'describe-images'.
-  :images - an Image or collection of Image instances, optional.
-  :ids    - a Image ID or collection of image IDs, optional.
-  Returns nil."
-  [& {:keys [images ids]}]
-  (let [images (concat (listify images) (describe-images :ids ids))]
+  "Report on zero or more Image instances,
+   fetch them if none are specified as with 'describe-images'.
+
+   CAUTION: without filters, this call returns a lot of data and can take a long time.
+   :owned-by :self and/or :exec-by :self is recommended to do some basic filtering if
+   you don't specify specific images/ids.
+
+   :images - an Image or collection of Image instances, optional.
+
+   :fields - set of fields (information) to display in addition to image id.
+             Defaults to: #{:ImageLocation :Architecture :ImageType :StoreType
+                      :Platform :State :Description :Tags}
+             Additional fields include: :Name, :Owner :Devices
+   :include Set of additional fields to display, defaults to #{}
+   :exclude Set of fields to exclude from the display, defaults to #{}.
+
+   The following filtering keywords are as documented in 'describe-images':
+   :ids, :owned-by, :exec-by.
+
+   Returns nil."
+  [& {:keys [images ids owned-by exec-by fields include exclude]
+      :or {fields #{:ImageLocation :Architecture :ImageType :StoreType :Platform :State
+                    :Description :Tags}
+           include #{} exclude #{}}}]
+  {:pre [(set? include) (set? exclude) (set? fields)]}
+   
+  (let [fetched-images (if (or (not images) ids)
+                         (describe-images :ids ids :owned-by owned-by :exec-by exec-by))
+        images (concat (listify images) fetched-images)
+        fields (difference (union fields include) exclude)]
     (doseq [image images]
-      (println (.getImageId image)
-               (.getImageLocation image) ; image location contains account (owner id) and name ??
-               ;;(.getName image)
-               ;;(.getOwnerId image)
-               (.getArchitecture image)
-               (.getImageType image)
-               (empty-string-alternative (.getPlatform image) "not-Win")
-               (.getState image)
-               (.getDescription image)
-               (squish-tags (.getTags image))))))
+      (pu (.getImageId image))
+      ;; image location contains account (owner id) and name
+      ;; making Name and OwnerId info redundant ... ?  Seems like it
+      (pif (:ImageLocation fields) (.getImageLocation image) pq)
+      (pif (:Name fields) (.getName image) pq)
+      (pif (:Owner fields) (.getOwnerId image) pu)
+      (pif (:Architecture fields) (.getArchitecture image) pu)
+      (pif (:ImageType fields) (.getImageType image) pu)
+      (pif (:Platform fields) 
+           (empty-string-alternative (.getPlatform image) "sane") pu)
+      ;; Note that .getRootDeviceName seems to be nil for instance stores
+      (pif (:StoreType fields) (.getRootDeviceType image) pu) ; "ebs" or "instance-store"
+      (pif (:State fields) (.getState image) pu)
+      (pif (:Description fields) (.getDescription image) pq)
+      (pif (:Tags fields) (squish-tags (.getTags image)) pq)
+      (println)
+      (when (:Devices fields)
+        (doseq [blockDeviceMapping (.getBlockDeviceMappings image)]
+          (print " " (.getDeviceName blockDeviceMapping)
+                 (.getVirtualName blockDeviceMapping)
+                 (.getNoDevice blockDeviceMapping))
+          (if-let [ebsBlockDevice (.getEbs blockDeviceMapping)] ; m/b null
+            (do
+              (print " ")
+              (println (.getSnapshotId ebsBlockDevice)
+                       (.getVolumeType ebsBlockDevice)
+                       (.getVolumeSize ebsBlockDevice)
+                       (.getIops ebsBlockDevice)
+                       (.getDeleteOnTermination ebsBlockDevice)))
+            (println)))))))
       
 
 (defn create-image
@@ -979,6 +1051,48 @@
     (let [result (.createImage (ec2) request)]
       (unless quiet (println "Image created is" (.getImageId result)))
       (.getImageId result))))
+
+
+;; *TBD* How does one delete an instance store AMI?
+;; Answer here: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/deregister-ami.html
+;; (Good link to have for delete-image logic, fyi).
+;; In short: deregister, then  deleteBundle.  *TODO*
+;;
+;; *TODO*: there's some additional smarts we can put in here below (things we don't deal
+;; with, see function code).
+;;
+;; Also, it would be nice to warn and require a :force if the image to be deleted
+;; is associated with EC2 instances on the account (running or not).
+(defn delete-image
+  "To delete an image, you need to deregister the image and delete the snapshot
+   behind it. The snapshot is found in the BlockDeviceMappings for the image.
+   This function provides that capability."
+  [image-id]
+  {:pre [image-id]}
+  (let [images (describe-images :ids image-id)]
+    (if (empty? images)
+      (throw (Exception. (str "Image " image-id " does not appear to exist"))))
+    (let [image (first images)
+          blockDeviceMappings (.getBlockDeviceMappings image)]
+      (if (empty? blockDeviceMappings)
+        (throw (Exception. (str "Image " image-id " does not appear to have block device mappings."
+                                " I am unsure of how to delete it."))))
+      (let [ebsBlockDevices (filter identity (map #(.getEbs %) blockDeviceMappings))]
+        (if (> (count ebsBlockDevices) 1)
+          (throw (Exception. (str "Image " image-id " has more than one EBS block device mapping."
+                                  " I don't deal with that right now, perhaps I should report on them and ignore them.  *TBD*"))))
+        (if (= (count ebsBlockDevices) 0)
+          (throw (Exception. (str "Image " image-id " has no EBS block device mappings"
+                                  " I don't know how to delete such an image."))))
+        (let [snapshot-id (.getSnapshotId (first ebsBlockDevices))]
+          (println)
+          (println "The following image will be deregistered, and the associated EBS snapshot deleted.")
+          (report-images :images images :include #{:Devices})
+          (.deregisterImage (ec2) (DeregisterImageRequest. image-id))
+          (println "... image" image-id "deregistered")
+          (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id))
+          (println "... snapshot" snapshot-id "deleted")
+          (println "Image deletion complete."))))))
 
 
 ;;;
