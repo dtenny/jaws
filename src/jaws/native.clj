@@ -13,7 +13,7 @@
             DescribeAlarmsRequest])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
-            CreateTagsRequest
+            CreateImageRequest CreateTagsRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance InstanceAttributeName
@@ -380,7 +380,7 @@
   
 (defn create-tags
   "Create tags for any specific EC2 entity that can have tags.
-   Specify the entity ID and a map of tag key/value pairs.
+   Specify the entity ID (or list of entity IDs) and a map of tag key/value pairs.
    Strings and vals are assumed strings, however keywords are acceptable
    in which case their names will be used.
    Returns nil."
@@ -388,7 +388,7 @@
   {:pre [(map? tag-map)]}
   (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
         tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
-    (.createTags (ec2) (CreateTagsRequest. (list entity) tags))))
+    (.createTags (ec2) (CreateTagsRequest. (listify entity) tags))))
     
 
 ;;;
@@ -893,24 +893,8 @@
 
                      
 ;;;
-;;; EC2 Misc
+;;; EC2 Images
 ;;;
-
-(defn ec2-describe-account-attributes
-  []
-  (let [ec2 (ec2)
-        result (.describeAccountAttributes ec2)]
-    (into {}
-          (map (fn [accountAttribute]
-                 [(keyword (.getAttributeName accountAttribute))
-                  (let [v (map (fn [attributeValue]
-                                 (.getAttributeValue attributeValue))
-                               (.getAttributeValues accountAttribute))]
-                    (if (= (count v) 1)
-                      (first v)
-                      v))])
-               (.getAccountAttributes result)))))
-
 
 (defn ec2-describe-all-images
   []
@@ -947,6 +931,76 @@
       #_ (doseq [image images] (println (str image))) ; /tmp/native-images
       )))
           
+(defn describe-images
+  "Return a list of Image objects.  Beware calling this without IDs or other filters.
+   Options:
+   :ids - an image id or seq of image ids"
+  [& {:keys [ids]}]
+  (let [request (DescribeImagesRequest.)]
+    (if ids (.setImageIds request (listify ids)))
+    (.getImages (.describeImages (ec2) request))))
+
+(defn report-images
+  "Report on zero or more Image instances, fetch them if none are specified as with 'describe-images'.
+  :images - an Image or collection of Image instances, optional.
+  :ids    - a Image ID or collection of image IDs, optional.
+  Returns nil."
+  [& {:keys [images ids]}]
+  (let [images (concat (listify images) (describe-images :ids ids))]
+    (doseq [image images]
+      (println (.getImageId image)
+               (.getImageLocation image) ; image location contains account (owner id) and name ??
+               ;;(.getName image)
+               ;;(.getOwnerId image)
+               (.getArchitecture image)
+               (.getImageType image)
+               (empty-string-alternative (.getPlatform image) "not-Win")
+               (.getState image)
+               (.getDescription image)
+               (squish-tags (.getTags image))))))
+      
+
+(defn create-image
+  "Create an EBS backed AMI from a running or stopped EBS-backed instance.
+   Name is 3-128 alphanumeric characters and any of [-()./_].
+   Returns the resulting image-id.
+   Options:
+   :quiet     - if true, do not print the resulting image ID to *out*.
+   :no-reboot - if true do not stop and reboot the instance. By default
+                instances are stopped for the image creation, then restarted.
+                TBD: What happens if the instance is already stopped?  Is it restarted?
+                I usually specify :no-reboot true on a stopped instance to be sure.
+   :description - a description of the instance."
+  [instance-id name
+   & {:keys [description no-reboot quiet]}]
+  (let [request (CreateImageRequest. instance-id name)]
+    (if no-reboot (.setNoReboot request true))
+    (if description (.setDescription request description))
+    (let [result (.createImage (ec2) request)]
+      (unless quiet (println "Image created is" (.getImageId result)))
+      (.getImageId result))))
+
+
+;;;
+;;; EC2 Misc
+;;;
+
+(defn ec2-describe-account-attributes
+  []
+  (let [ec2 (ec2)
+        result (.describeAccountAttributes ec2)]
+    (into {}
+          (map (fn [accountAttribute]
+                 [(keyword (.getAttributeName accountAttribute))
+                  (let [v (map (fn [attributeValue]
+                                 (.getAttributeValue attributeValue))
+                               (.getAttributeValues accountAttribute))]
+                    (if (= (count v) 1)
+                      (first v)
+                      v))])
+               (.getAccountAttributes result)))))
+
+
 (defn report-key-pairs
   []
   (doseq [keyPairInfo (.getKeyPairs (.describeKeyPairs (ec2)))]
