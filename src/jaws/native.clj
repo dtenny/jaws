@@ -17,8 +17,10 @@
             DeleteSnapshotRequest DeregisterImageRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
-            Filter Instance InstanceAttributeName
-            ModifyInstanceAttributeRequest StopInstancesRequest Tag TerminateInstancesRequest])
+            Filter Instance InstanceAttributeName Image
+            LaunchPermissionModifications LaunchPermission
+            ModifyImageAttributeRequest ModifyInstanceAttributeRequest
+            StopInstancesRequest Tag TerminateInstancesRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import [com.amazonaws.services.identitymanagement.model
             GetInstanceProfileRequest GetRolePolicyRequest GetRoleRequest
@@ -94,10 +96,18 @@
          (second (re-find #".*::(\d+):" (.getArn (.getUser (.getUser iam))))))
        (catch Exception x "<unknown>"))))
 
-(defn prompt-for-credentials
-  "Prompt user for keyword into cred-map for credential set to use.
-  Return the (validated) keyword."
-  []
+(defn cred-account-number
+  "Given a keyword for credentials, return (as a string) the AWS account for the credentials, or
+   '<unknown>' if the credentials aren't valid."
+  [cred-keyword]
+  (let [cred-info (get @cred-map cred-keyword)]
+    (if-not cred-info
+      (throw (Exception. (str "Credentials keyword " cred-keyword
+                              " is not in the credentials map."))))
+    (let [[access-key secret-key _] cred-info]
+      (get-user-account-number-for-prompt access-key secret-key))))
+
+(defn list-credentials "Print list of known credentials and account numbers" []
   (println "The following credential files are known:")
   (let [cred-seq (seq @cred-map)
         max-key-length (reduce max (map (fn [e] (count (str (key e)))) cred-seq))]
@@ -107,7 +117,13 @@
                    max-key-length
                    (key entry)
                    (get-user-account-number-for-prompt access-key secret-key)
-                   (str cred-file-path)))))
+                   (str cred-file-path))))))
+
+(defn prompt-for-credentials
+  "Prompt user for keyword into cred-map for credential set to use.
+  Return the (validated) keyword."
+  []
+  (list-credentials)
   (loop [answer (read-string
                  (prompt "Which credentials would you like to use? (specify keyword)"))]
     (if-let [creds (answer @cred-map)]
@@ -905,6 +921,50 @@
 ;;; EC2 Images
 ;;;
 
+(defn image-state
+  "Fetch image state for an image id.
+   Returns one of :available, :deregistered, or :pending."
+  [image-id]
+  (->> (.describeImages
+        (ec2) 
+        (doto (DescribeImagesRequest.)
+          (.setImageIds (list image-id))))
+       .getImages
+       first
+       .getState
+       keyword))
+
+(defmulti  wait-for-image-state
+  "Wait for an image (AMI) to reach the designated state.
+
+   Image may be an Image or Image ID.
+   State should be one of :available or :deregistered.
+
+   Note that state is re-fetched for the image call until the target
+   state is reached, this doesn't just check image state on a previously fetched Image.
+
+   Optional keyword args include:
+   :verbose - print a 'waiting for <id> to enter the <y> state' message with a dot
+              every 5 seconds.
+   Returns nil."
+  (fn [& args] (class (first args))))
+(defmethod wait-for-image-state Image [image state & args]
+  (wait-for-image-state (.getImageId image) state))
+(defmethod wait-for-image-state String [image-id state & {:keys [verbose]}]
+  {:pre [(get #{:available :deregistered} state)]}
+  (when verbose
+    (let [initial-state (image-state image-id)]
+      (if-not (= initial-state state)
+        (println "Waiting for" initial-state "image" image-id
+                 "to enter the" state "state"))))
+  (while (not= (image-state image-id) state)
+    (Thread/sleep 5000)
+    (if verbose
+      (do (print ".") (flush))))
+  (if verbose
+    (println)))
+
+
 (defn ec2-describe-all-images
   []
   (let [ec2 (ec2)]
@@ -1052,6 +1112,26 @@
       (unless quiet (println "Image created is" (.getImageId result)))
       (.getImageId result))))
 
+(defn image-add-launch-permission
+  "Add accounts to an image' launch permissions.  Returns nil.
+   Accounts should be AWS account numbers (as strings or numbers).
+   This function is a currently a shortcut bandaid for a more
+   flexible interface to the modifyImageAttribute API."
+  [image-id & accounts]
+  {:pre [(not (empty? accounts)) (string? image-id)]}
+  ;; See "DescribeImageAttributeRequest" docs for valid attributes, presently
+  ;; description, kernel, ramdisk, launchPermission, productCodes, blockDeviceMapping
+  (let [request (ModifyImageAttributeRequest.)
+        launch-mods (LaunchPermissionModifications.)]
+    (doto launch-mods
+      (.setAdd (map (fn [account]
+                      (doto (LaunchPermission.)
+                        (.setUserId (str account))))
+                    accounts)))
+    (doto request
+      (.setImageId image-id)
+      (.setLaunchPermission launch-mods))
+    (.modifyImageAttribute (ec2) request)))
 
 ;; *TBD* How does one delete an instance store AMI?
 ;; Answer here: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/deregister-ami.html

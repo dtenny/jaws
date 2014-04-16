@@ -411,7 +411,7 @@
                 (update-cred (key e) [(first new-creds) (second new-creds) cred-file-path])
                 ;; Not clear how long we need to sleep here, but if we don't sleep
                 ;; the new credentials may not yet be valid.
-                (Thread/sleep 3000)
+                (Thread/sleep 10000)
                 (println "Deactivating:" old-key-state)
                 (iam/update-access-key :access-key-id old-access-key :status "Inactive")))))))))
 
