@@ -1056,7 +1056,12 @@
 ;; *TBD* How does one delete an instance store AMI?
 ;; Answer here: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/deregister-ami.html
 ;; (Good link to have for delete-image logic, fyi).
+;; See also: https://aws.amazon.com/articles/Amazon-EC2/637
+;; Note that multiple AMIs can be registered from a single bundle in S3.
 ;; In short: deregister, then  deleteBundle.  *TODO*
+;; *HELP*: There is no deleteBundle API or ec2-delete-bundle operation as referenced in the page.  Hmmm
+;; (may be under "AMI tools", not the EC2 CLI tools).  Or it's basically just S3 file deletion.
+;; Ruby code. Gets list of files to delete from the manifest file, then deletes them.
 ;;
 ;; *TODO*: there's some additional smarts we can put in here below (things we don't deal
 ;; with, see function code).
@@ -1066,7 +1071,8 @@
 (defn delete-image
   "To delete an image, you need to deregister the image and delete the snapshot
    behind it. The snapshot is found in the BlockDeviceMappings for the image.
-   This function provides that capability."
+   This function provides that capability.
+   *TODO*: Doesn't presently support instance-stores, needs a deleteBundle for those."
   [image-id]
   {:pre [image-id]}
   (let [images (describe-images :ids image-id)]
