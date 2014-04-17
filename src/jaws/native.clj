@@ -807,7 +807,7 @@
              ec2 (doto (DescribeInstancesRequest.)
                    (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (binding [*indent* (+ *indent* 4)]
-          (report-instances :data describeInstancesResult :exclude #{:VpcId}))))))
+          (report-instances :data describeInstancesResult :exclude #{:VpcId} :include #{:PrivateIpAddress}))))))
 
 ;;;
 ;;; Auto-scaling stuff
