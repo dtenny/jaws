@@ -1334,6 +1334,9 @@
                      (map #(.getPolicyName %) (.getLBCookieStickinessPolicies policies)))
           (cl-format true "~2@TOther Policies: ~s~%" (seq (.getOtherPolicies policies)))))
       ;; These are just instance stubs, not the same as .ec2.model.Instance
+      ;; *TODO*/*TBD*: These instances can refer to non-existent instances!
+      ;; Might be useful to look up the instance and report whether or not it actually exists.
+      ;; A certain scribe relay ELB I know of had an invalid instance reference.
       (when-let [instances (and (:Instances fields)
                                (better-not-empty? (seq (.getInstances desc))))]
         (cl-format true "~2@TInstances: ~a~%" (map #(.getInstanceId %) instances))))))
