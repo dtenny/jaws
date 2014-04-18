@@ -19,8 +19,10 @@
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
-            ModifyImageAttributeRequest ModifyInstanceAttributeRequest
-            StopInstancesRequest Tag TerminateInstancesRequest])
+            ModifyImageAttributeRequest ModifyInstanceAttributeRequest RunInstancesRequest
+            StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest])
+  (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
+  (:import [com.amazonaws.services.elasticloadbalancing.model DescribeLoadBalancersRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
   (:import [com.amazonaws.services.identitymanagement.model
             GetInstanceProfileRequest GetRolePolicyRequest GetRoleRequest
@@ -535,6 +537,7 @@
 
 ;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
 ;; but this is only available via an DescribeAutoScalingInstancesResult.
+;; *TBD*: List valid keywords for fields if an improper one is given, right now we silently ignore it.
 (defn report-instances 
   "Print a information about instances.
    The default is to print one line of information per instance, unless options
@@ -561,7 +564,7 @@
            :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
            Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
-           Additional fields include: :VolumeIds, :InstanceProfile, :LaunchTime,
+           Additional fields include: :VolumeIds, :InstanceProfile, :LaunchTime, :StoreType
            :PrivateIpAddress :PrivateDnsName :PublicIpAddress.
    :include Set of additional fields to display, defaults to #{}
    :exclude Set of fields to exclude from the display, defaults to #{}.
@@ -612,6 +615,7 @@
       (xpr :State (.getName (.getState instance)) pu)
       (xpr :LaunchTime (str (.getLaunchTime instance)) pu)
       (xpr :InstanceType (.getInstanceType instance) pu)
+      (xpr :StoreType (.getRootDeviceType instance) pu) ; "ebs" or "instance-store"
       (xpr :InstanceProfile
            (if-let [ip (.getIamInstanceProfile instance)]
              (.getArn ip)
@@ -675,8 +679,73 @@
          (filter tag-regex-fn)
          )))
 
+(defn run-instances
+  "Start new instances from a specificed AMI.  *FINISH*: this is a work in progress.
+   Returns a sequence of instance ids created.
+   
+   Arguments:
+   ami-id  The image id to use.
+   :keyname the name of the key pair to use.
+   :type the instance type to use ({m1,m3,c1}.{small,medium,[x]large}, etc)
+         *TODO* online help to list options for this please.
+   :group-ids security group id or collection of ids to use for secrity groups
+   :group-names security group name or collection of names to use for secrity groups
+                (ec2-classic, default-vpc only, can use with group-ids as well)
+   :min    minimum number of instances to run
+   :max    maximum number of instances to run
+   :wait   true if this function should not exit until all instances have started.
+           Note that they instances may not yet be responsive just because they're 'running'
+           and have a DNS address.  YMMV.
+   :region a region keyword from 'region-map' to override *region*."
+  [ami-id & {:keys [keyname type group-ids group-names min max wait region]
+             :or {region *region* type "t1.micro" min 1 max 1}}]
+  {:pre [(not (= region :all))]}
+  (let [min (int min)
+        max (int max)
+        request (RunInstancesRequest. ami-id min max)]
+    (.setInstanceType request type)
+    (if keyname (.setKeyName request keyname))
+    (if group-ids (.setSecurityGroupIds request (listify group-ids)))
+    (if group-names (.setSecurityGroups request (listify group-names)))
+    (let [reservation (->> (.runInstances (ec2 region) request)
+                           (.getReservation))
+          instances (seq (.getInstances reservation))
+          instance-ids (map #(.getInstanceId %) instances)
+          user-name (iam-get-user-name)]
+      (cl-format true "Instance~p created: ~s~%" (count instances) instance-ids)
+      (doseq [id instance-ids]
+        (create-tags id {:created-by user-name})) ; *TBD*: let caller pass additional tags
+      (if wait
+        (doseq [id instance-ids]
+          (wait-for-instance-state id :running :verbose true)))
+      instance-ids)))
+
+(defn start-instances
+  "Start one or more stopped instances.
+   ids     a string instance ID or collection/sequence of same specifying specific instances
+           to be started.
+   :wait   true if this function should not exit until all instances have started.
+           Note that they instances may not yet be responsive just because they're 'running'
+           and have a DNS address.  YMMV.
+   :region a region keyword from 'region-map' to override *region*."
+  [ids & {:keys [region wait]
+          :or {region *region*}}]
+  {:pre [(not (= region :all))]}
+  (let [ids (listify ids)]
+    (doseq [instanceStateChange 
+            (->> (.startInstances (ec2 region) (StartInstancesRequest. ids))
+                 (.getStartingInstances))]
+      (println (.getInstanceId instanceStateChange)
+               (.getName (.getPreviousState instanceStateChange))
+               "=>"
+               (.getName (.getCurrentState instanceStateChange))))
+    (if wait
+      (doseq [id ids]
+        (wait-for-instance-state id :running :verbose true)))))
+
+
 (defn stop-instances
-  "Stop one or more isntances, waiting if requested.
+  "Stop one or more instances, waiting if requested.
    ids     a string instance ID or collection/sequence of same specifying specific instances
            to be deleted.
    :wait   true if this function should not exit until all instances have stopped.
@@ -1179,7 +1248,96 @@
           (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id))
           (println "... snapshot" snapshot-id "deleted")
           (println "Image deletion complete."))))))
+
+;;;
+;;; ELB
+;;;
 
+(defn ^AmazonElasticLoadBalancingClient elb
+  "Return an AmazonElasticLoadBalancingClient ready for calls for a single (optional) region.
+  'region' is a keyword defaulting to *region*."
+  ([] (elb *region*))
+  ([region]
+     (let [elb (AmazonElasticLoadBalancingClient. (make-aws-creds))
+           region (if (instance? Region region) region (get-valid region-map region))]
+       (.setRegion elb region)
+       elb)))
+
+(defn describe-elbs
+  "Return LoadBalancerDescription objects for ELB's.  If one or more names are specified, describe only those ELB's."
+  [& elb-names]
+  (.getLoadBalancerDescriptions
+   (if elb-names
+     (.describeLoadBalancers (elb) (DescribeLoadBalancersRequest. elb-names))
+     (.describeLoadBalancers (elb)))))
+
+;; *TODO*: replace jdt.core 'not-empty?' with this
+(defn better-not-empty?
+  "Returns coll if the specified collection or sequence is not empty, otherwise nil."
+  [coll]
+  (if (empty? coll)
+    nil
+    coll))
+
+(defn report-elbs
+  "Print information about elastic load balancers.  Returns nil.
+   :descs -if specified, one or a collection of LoadBalancerDescription objects as if from 'describe-elbs'.
+   :names -if specified, one or a colelction of ELB names, passed to 'describe-elbs'.
+           If neither :names nor :descs is specified, we call (describe-elbs) for descriptions.
+   :fields - A set that defaults to the following:
+           #{:Name :DnsName :Vpc :Scheme :Subnets :Sgs :SourceSg}
+           and may also include: :HostedZoneName :HostedZoneId :Azs :Ctime :Backends :Instances :Listeners :Policies.
+   :include - A set of additional fields to include as described with :fields.
+   :exclude - A set of fields to exclude as described with :fields."
+  [& {:keys [descs names fields include exclude]
+      :or {fields #{:Name :Vpc :DnsName :Scheme :Subnets :Sgs :SourceSg}
+           include #{} exclude #{}}}]
+  {:pre [(set? include) (set? exclude) (set? fields)]}
+  (let [names (listify names)
+        descs (listify descs)
+        descs (or (better-not-empty?
+                   (concat (and names (apply describe-elbs names)) descs))
+                  (describe-elbs))
+        fields (difference (union fields include) exclude)]
+    (doseq [desc descs]
+      (pq (.getLoadBalancerName desc))
+      (pif (:Vpc fields) (empty-string-alternative (.getVPCId desc) "<noVpc>") pu)
+      (pif (:DnsName fields) (.getDNSName desc) pu)
+      ;; Note that the zone name is often the same as dns name.
+      (pif (:HostedZoneName fields) (.getCanonicalHostedZoneName desc) pq)
+      (pif (:HostedZoneId fields) (.getCanonicalHostedZoneNameID desc) pu)
+      (pif (:Scheme fields) (.getScheme desc) pu)
+      (pif (:Azs fields) (seq (.getAvailabilityZones desc)) pu)
+      (pif (:Subnets fields) (or (seq (.getSubnets desc)) "<noSubnets>") pu)
+      (pif (:Sgs fields) (or (seq (.getSecurityGroups desc)) "<noSGs>") pu)
+      (pif (:SourceSg fields) (.getGroupName (.getSourceSecurityGroup desc)) pu)
+      (pif (:Ctime fields) (str (.getCreatedTime desc)) pu)
+      (println)
+      (when (:Backends fields)
+        (doseq [bsd (seq (.getBackendServerDescriptions desc))]
+          (cl-format true "~2@TBackend Server: Port ~d, Policy Names: ~s~%"
+                     (.getInstancePort bsd) (.getPolicyNames bsd))))
+      (when (:Listeners fields)
+        (doseq [listener (map #(.getListener %) (.getListenerDescriptions desc))]
+          (cl-format true "~2@TListener: Instance Port ~d, Instance Protocol ~a, ELB Port ~d, ELB Protocl ~a, SSL Cert: ~a~%"
+                     (.getInstancePort listener)
+                     (.getInstanceProtocol listener)
+                     (.getLoadBalancerPort listener)
+                     (.getProtocol listener)
+                     (.getSSLCertificateId listener))))
+      (when (:Policies fields)
+        ;; Not sure this is working...
+        (let [policies (.getPolicies desc)]
+          (cl-format true "~2@TAppCookieStickinessPolicies:~%~{~4@T~s~^~%~}"
+                     (map (fn [p] [(.getCookieName p) (.getPolicyName p)]) (.getAppCookieStickinessPolicies policies)))
+          (cl-format true "~2@TLBCookieStickinessPolicies:~%~{~4@T~s~^~%~}"
+                     (map #(.getPolicyName %) (.getLBCookieStickinessPolicies policies)))
+          (cl-format true "~2@TOther Policies: ~s~%" (seq (.getOtherPolicies policies)))))
+      ;; These are just instance stubs, not the same as .ec2.model.Instance
+      (when-let [instances (and (:Instances fields)
+                               (better-not-empty? (seq (.getInstances desc))))]
+        (cl-format true "~2@TInstances: ~a~%" (map #(.getInstanceId %) instances))))))
+        
 
 ;;;
 ;;; EC2 Misc

@@ -123,3 +123,5 @@
     (println "SSH output for" (count instances) "instances in /tmp/counters-prod.out")))
 
 ;; Note that we can derive regions for instances from availability zones, which is in the Placement object from instance.getPlacement()
+
+(load-file "src/jaws/scribe-private.clj")
