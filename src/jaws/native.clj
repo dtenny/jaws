@@ -1271,7 +1271,7 @@
      (.describeLoadBalancers (elb) (DescribeLoadBalancersRequest. elb-names))
      (.describeLoadBalancers (elb)))))
 
-;; *TODO*: replace jdt.core 'not-empty?' with this
+;; Note: jdt.core's 'not-empty?' is now equivalent to this, but wasn't when this was written.
 (defn better-not-empty?
   "Returns coll if the specified collection or sequence is not empty, otherwise nil."
   [coll]
