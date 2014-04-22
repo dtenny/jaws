@@ -1,7 +1,8 @@
 (ns jaws.native
   (:use clojure.repl)
   (:use clojure.set)
-  (:use [jdt core cl shell easyfs])
+  (:use [jdt core cl shell])
+  (:use [jdt.easyfs :exclude [copy]])
   (:use [clojure.java.io])
   (:use [clojure.pprint :only [cl-format]])
   (:use [clojure.tools.logging :exclude [trace]])
@@ -1271,14 +1272,6 @@
      (.describeLoadBalancers (elb) (DescribeLoadBalancersRequest. elb-names))
      (.describeLoadBalancers (elb)))))
 
-;; *TODO*: replace jdt.core 'not-empty?' with this
-(defn better-not-empty?
-  "Returns coll if the specified collection or sequence is not empty, otherwise nil."
-  [coll]
-  (if (empty? coll)
-    nil
-    coll))
-
 (defn report-elbs
   "Print information about elastic load balancers.  Returns nil.
    :descs -if specified, one or a collection of LoadBalancerDescription objects as if from 'describe-elbs'.
@@ -1295,7 +1288,7 @@
   {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [names (listify names)
         descs (listify descs)
-        descs (or (better-not-empty?
+        descs (or (not-empty?
                    (concat (and names (apply describe-elbs names)) descs))
                   (describe-elbs))
         fields (difference (union fields include) exclude)]
@@ -1338,7 +1331,7 @@
       ;; Might be useful to look up the instance and report whether or not it actually exists.
       ;; A certain scribe relay ELB I know of had an invalid instance reference.
       (when-let [instances (and (:Instances fields)
-                               (better-not-empty? (seq (.getInstances desc))))]
+                               (not-empty? (seq (.getInstances desc))))]
         (cl-format true "~2@TInstances: ~a~%" (map #(.getInstanceId %) instances))))))
         
 
