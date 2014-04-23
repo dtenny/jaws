@@ -1,7 +1,7 @@
 (ns jaws.scribe
   (:use clojure.repl)
   (:use clojure.set)
-  (:use [jdt core cl shell easyfs])
+  (:use [jdt core cl shell easyfs ssh])
   (:use jaws.native)                    ;you may need to load this file first
   (:use [clojure.pprint :only [cl-format]])
   (:import [com.amazonaws.services.ec2.model
@@ -50,41 +50,50 @@
   (str (probe-file "~/SECURE-NO-POSTING/deployScribeRelay-aws-analytics-pr.ssh-key")))
 (def scribe-user "deployScribeRelay")
 
-(defprogram ssh "/usr/bin/ssh")
+(comment
+  (defprogram ssh "/usr/bin/ssh")
 
-(defn scribe-ssh-term
-  "Start an interactive ssh session with the indicated scribe relay dns name."
-  [dnsname]
-  ;; Consider calling .waitFor on the result
-  (.exec (Runtime/getRuntime)
-         (into-array
-          ["xterm" "-fn" "*liberation mono-bold-r-normal*" "-e"
-           ;; If your terminal exits prematurely because of some error,
-           ;; append a "; read" to the string you invole with -e so it'll wait before
-           ;; exiting. That might be useful in general too, for that matter.
-           (str "ssh -i " scribe-private-key " -l " scribe-user
-                " -o " "StrictHostKeyChecking=false " dnsname
-                " ; echo 'hit enter to quit' ; read")])))
+  (defn scribe-ssh-term
+    "Start an interactive ssh session with the indicated scribe relay dns name."
+    [dnsname]
+    ;; Consider calling .waitFor on the result
+    (.exec (Runtime/getRuntime)
+           (into-array
+            ["xterm" "-fn" "*liberation mono-bold-r-normal*" "-e"
+             ;; If your terminal exits prematurely because of some error,
+             ;; append a "; read" to the string you invole with -e so it'll wait before
+             ;; exiting. That might be useful in general too, for that matter.
+             (str "ssh -i " scribe-private-key " -l " scribe-user
+                  " -o " "StrictHostKeyChecking=false " dnsname
+                  " ; echo 'hit enter to quit' ; read")])))
 
-(defn scribe-ssh
-  "Perform an ssh command to a scribe host indicated by public dns name.
+  (defn scribe-ssh
+    "Perform an ssh command to a scribe host indicated by public dns name.
    E.g. (scribe-ssp \"ec2-23-23-83-179.compute-1.amazonaws.com\" \"ls\")
    Return a sequence of strings, one string for each line of output."
-  [dnsname command]
-  (ssh "-i" scribe-private-key "-l" scribe-user "-o" "StrictHostKeyChecking=false"
-       dnsname command))
+    [dnsname command]
+    (ssh "-i" scribe-private-key "-l" scribe-user "-o" "StrictHostKeyChecking=false"
+         dnsname command))
+  )
+
+(def proxy-host (atom nil))             ;set in scribe-private.clj
+(def proxy-port (atom nil))             ;set in scribe-private.clj
+(defn scribe-ssh [dnsname command & {:keys [tty]}]
+  (ssh command :private-key scribe-private-key
+       :target-user scribe-user :target-host dnsname
+       :proxy-host @proxy-host :proxy-port @proxy-port :tty tty))
   
 ;; Common remote dirs/hosts I need to examine.
 (def stunnel-conf "/etc/stunnel/stunnel.conf")
 (def scribe-conf "/etc/scribe/conf/scribe.conf")
 (def scribe-log-dir "/media/scribe/log")
 (def scribe-store-dir "/media/scribe/store") ; (find . -type f | wc -l) useful
-(def prod-intake-host "scribe-slough-integration.pr.analytics.nokia.com")
-(def preprod-intake-host "scribe-noklab-integration.preprod.analytics.nokia.com")
+(def prod-intake-host (atom nil)) ; set in scribe-private
+(def preprod-intake-host (atom nil)) ; set in scribe-private
 
 ;; Common commands I use
 (def scribe-counters "scribe_ctrl counters")
-(def ping-slough (str "ping -c 1 " prod-intake-host))
+(def ping-slough (str "ping -c 1 " @prod-intake-host))
 
 ;; Common working sets I generate
 ;; (def preprod-instances (scribe-all-preproduction-instances))
@@ -117,11 +126,45 @@
     (with-output ["/tmp/counters-prod.out"]
       (doseq [instance instances]
         (let [dnsname (.getPublicDnsName instance)]
-          (println "scribe_ctrl counters for " (get-autoscaling-groupname instance) dnsname)
+          (println "scribe_ctrl counters for "
+                   (get-autoscaling-groupname instance) dnsname
+                   "at" (date->utc))
           (printlines (scribe-ssh dnsname (str "echo $(hostname) ; " scribe-counters)))
           (flush))))
     (println "SSH output for" (count instances) "instances in /tmp/counters-prod.out")))
 
 ;; Note that we can derive regions for instances from availability zones, which is in the Placement object from instance.getPlacement()
+
+(defn parse-scribe-counter-line [line]
+  "Return a [counter-name counter-value] vector, or nil if the line isn't a
+   scribe_ctrl output line with a counter."
+  ;; Category name, category type (received good, retries), count
+  ;; E.g. ovisearch.recommendations-servlet.recommendations:received good: 3
+  (if-let [[match category type count]
+           (re-matches #"([^:]+):([^:]+): (\d+)\s*" line)]
+    [(str category ":" type) (Long/parseLong count)]))
+
+(defn aggregate-counters
+  "Return a map of counters aggregated scribe_ctrl output for multpile servers
+   contained in one file."
+  [file]
+  (loop [aggregate-map (transient {})
+         parse-coll (filter identity
+                            (map parse-scribe-counter-line (readlines file)))]
+    (if (empty? parse-coll)
+      (persistent! aggregate-map)
+      (let [[category count] (first parse-coll)]
+        (if-let [old-count (get aggregate-map category)]
+          (recur (assoc! aggregate-map category (+ count old-count))
+                 (rest parse-coll))
+          (recur (assoc! aggregate-map category count)
+                 (rest parse-coll)))))))
+
+(defn print-aggregate-counters
+  "Print a map of scribe counters, sorted by category (key) name."
+  [file]
+  (let [aggregate-map (aggregate-counters file)]
+    (doseq [e (sort (fn [e1 e2] (compare (key e1) (key e2))) (seq aggregate-map))]
+      (println (str (key e) ": " (val e))))))
 
 (load-file "src/jaws/scribe-private.clj")
