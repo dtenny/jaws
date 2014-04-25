@@ -6,6 +6,7 @@
   (:use [clojure.java.io])
   (:use [clojure.pprint :only [cl-format]])
   (:use [clojure.tools.logging :exclude [trace]])
+  (:import [com.amazonaws AmazonServiceException])
   (:import [com.amazonaws.auth BasicAWSCredentials])
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.autoscaling AmazonAutoScalingClient])
@@ -370,10 +371,22 @@
         key-pairs (.getKeyPairs result)]
     (= (count key-pairs) 1)))
 
+(defn security-group-id-exists?
+  "Return true if the specified security group id exists, false if it does not."
+  [group-id]
+  ;; Throws if the group does not exist.
+  (try 
+    (let [result (.describeSecurityGroups (ec2)
+                                          (doto (DescribeSecurityGroupsRequest.)
+                                            (.setGroupIds [group-id])))]
+      (>= (count (.getSecurityGroups result)) 1))
+    true
+    (catch Exception e false)))
+
 (defn security-group-name-exists?
   "Return true if the specified security group name exists, false if it does not."
   [group-name]
-  ;; Throws if the gruop does not exist.
+  ;; Throws if the group does not exist.
   (try 
     (let [result (.describeSecurityGroups (ec2)
                                           (doto (DescribeSecurityGroupsRequest.)
@@ -460,7 +473,11 @@
   (if verbose
     (println)))
   
-
+(defmulti  instance-id
+  "Retrieve the instance id of an instance (or, if the argument is already an ID, return the identity."
+  class)
+(defmethod instance-id String [instance-id] instance-id)
+(defmethod instance-id Instance [instance] (.getInstanceId instance))
 
 (defmulti  instance-public-dns-name
   "Retrieve the public dns name for an instance or instance id,
@@ -521,7 +538,11 @@
   [results]
   (->> (seqify results)
        flatten
-       (map (fn [describeInstancesResult] (seq (.getReservations describeInstancesResult))))
+       (map (fn [describeInstancesResult]
+              (seq (.getReservations describeInstancesResult))))
+       ;; Sometimes there are no reservations ina DescribeInstancesResult (get null)
+       ;; E.g. on filtered requests.
+       (filter identity)
        flatten
        (map (fn [reservation] (seq (.getInstances reservation))))
        flatten))
@@ -539,6 +560,8 @@
 ;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
 ;; but this is only available via an DescribeAutoScalingInstancesResult.
 ;; *TBD*: List valid keywords for fields if an improper one is given, right now we silently ignore it.
+;; *TBD*: Consider implicit merging of :instances and :instance-ids as we do in {start,stop,terminate}-instances.
+;; and eliminate one or the other of those keywords.
 (defn report-instances 
   "Print a information about instances.
    The default is to print one line of information per instance, unless options
@@ -680,6 +703,36 @@
          (filter tag-regex-fn)
          )))
 
+;; *TODO*: move to jdt.core
+(defn exception-retry
+  "Call function f with exception handler fe.  If an
+   exception is thrown by f, call fe on the exception, and then call f again
+   if the result of calling fe is logically true or unless fe throws.
+
+   If f completes execution without throwing we return the return value of f.
+   If f throws and fe returns logical false, return nil.
+
+   f must not return a function, this is prohibited and will result in an exception.
+
+   This function is a non-recursive workaround for situations for where
+   you want to recurse in a catch/finally statement (i.e. retry a try block in the face of
+   exceptions thrown from the try block).  You can't use 'recur' in catch/finally.
+   This works around it.
+
+   E.g. (loop [] (try (f) (catch Exception e (recur)))) ; WILL NOT WORK
+   but  (exception-retry f (fn [] true)) ; WILL WORK
+
+   In practice you want fe to examine the exception raised
+   and probably sleep before returning to try f again.  Maybe print a message
+   that this a retry is happening."
+  [f fe]
+  (let [tryfn
+        (fn [] (try (let [result (f)]
+                      (assert (not (fn? result)))
+                      result)
+                    (catch Exception e (if (fe e) f nil))))]
+    (trampoline tryfn)))
+
 (defn run-instances
   "Start new instances from a specificed AMI.  *FINISH*: this is a work in progress.
    Returns a sequence of instance ids created.
@@ -694,11 +747,21 @@
                 (ec2-classic, default-vpc only, can use with group-ids as well)
    :min    minimum number of instances to run
    :max    maximum number of instances to run
+   :private-ip-address A specific IP address in dotted IPV4 notation to be assigned to the instance
+           (vpc instances only).
+   :subnet A specific subnet ID for instances started in a VPC.
+   :retry-if If specified is a string corresponding to an one of error codes as documented
+             in http://docs.aws.amazon.com/AWSEC2/latest/APIReference/api-error-codes.html.
+             If an AmazonServiceException is thrown with code 400 and
+             AWS Error Code matching the parameter, we will retry the run-instances value.
+             Known useful codes: 'InvalidIPAddress.InUse' if you're retrying a specific
+             ip address assignment to a recently disassociated EIP or private IP address in a VPC.
    :wait   true if this function should not exit until all instances have started.
            Note that they instances may not yet be responsive just because they're 'running'
            and have a DNS address.  YMMV.
    :region a region keyword from 'region-map' to override *region*."
-  [ami-id & {:keys [keyname type group-ids group-names min max wait region]
+  [ami-id & {:keys [keyname type group-ids group-names min max private-ip-address subnet
+                    retry-if wait region]
              :or {region *region* type "t1.micro" min 1 max 1}}]
   {:pre [(not (= region :all))]}
   (let [min (int min)
@@ -708,8 +771,21 @@
     (if keyname (.setKeyName request keyname))
     (if group-ids (.setSecurityGroupIds request (listify group-ids)))
     (if group-names (.setSecurityGroups request (listify group-names)))
-    (let [reservation (->> (.runInstances (ec2 region) request)
-                           (.getReservation))
+    (if private-ip-address (.setPrivateIpAddress request private-ip-address))
+    (if subnet (.setSubnetId request subnet))
+    (let [run-fn (fn [] (->> (.runInstances (ec2 region) request)
+                             (.getReservation)))
+          handler-fn (fn [e]   ; return true if we should retry on exception e
+                       (if (and retry-if
+                                (instance? AmazonServiceException e)
+                                (= (.getStatusCode e) 400)
+                                (= (.getErrorCode e) retry-if))
+                         (do (println e)
+                             (println "Retrying the run-instances operation again after a 15 second sleep.")
+                             (Thread/sleep 15000)
+                             true)      ;true => please retry the run-fn in exception-retry
+                         (throw e)))
+          reservation (exception-retry run-fn handler-fn)
           instances (seq (.getInstances reservation))
           instance-ids (map #(.getInstanceId %) instances)
           user-name (iam-get-user-name)]
@@ -723,8 +799,8 @@
 
 (defn start-instances
   "Start one or more stopped instances.
-   ids     a string instance ID or collection/sequence of same specifying specific instances
-           to be started.
+   ids     an  instance or instance ID, or collection/sequence of same,
+           specifying specific instances to be started.
    :wait   true if this function should not exit until all instances have started.
            Note that they instances may not yet be responsive just because they're 'running'
            and have a DNS address.  YMMV.
@@ -732,7 +808,7 @@
   [ids & {:keys [region wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (listify ids)]
+  (let [ids (map instance-id (listify ids))]
     (doseq [instanceStateChange 
             (->> (.startInstances (ec2 region) (StartInstancesRequest. ids))
                  (.getStartingInstances))]
@@ -746,15 +822,15 @@
 
 
 (defn stop-instances
-  "Stop one or more instances, waiting if requested.
-   ids     a string instance ID or collection/sequence of same specifying specific instances
-           to be deleted.
+  "Stop one or more instances, waiting if requested.  Return value unspecified.
+   ids     an  instance or instance ID, or collection/sequence of same,
+           specifying specific instances to be stopped.
    :wait   true if this function should not exit until all instances have stopped.
    :region a region keyword from 'region-map' to override *region*."
   [ids & {:keys [region wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (listify ids)]
+  (let [ids (map instance-id (listify ids))]
     (doseq [instanceStateChange 
             (->> (.stopInstances (ec2 region) (StopInstancesRequest. ids))
                  (.getStoppingInstances))]
@@ -766,18 +842,18 @@
       (doseq [id ids]
         (wait-for-instance-state id :stopped :verbose true)))))
 
-;; *TODO*: Add a :wait keyword like we did for stop-instances
 (defn terminate-instances
-  "Terminate one or more instances.
-   ids     a string instance ID or collection/sequence of same specifying specific instances
-           to be deleted.
+  "Terminate one or more instances.  Return value unspecified.
+   ids     an  instance or instance ID, or collection/sequence of same,
+           specifying specific instances to be deleted.
    :region a region keyword from 'region-map' to override *region*.
+   :wait   if true, wait until the instance reaches state :terminated.
    :force  if true, ensure that we can disable the instance via termination APIs
            (i.e cancel 'DisableApiTermination' status)."
-  [ids & {:keys [region force]
+  [ids & {:keys [region force wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (listify ids)]
+  (let [ids (map instance-id (listify ids))]
     (if force
       (doseq [id ids]
         (.modifyInstanceAttribute (ec2 region)
@@ -790,7 +866,10 @@
       (println (.getInstanceId instanceStateChange)
                (.getName (.getPreviousState instanceStateChange))
                "=>"
-               (.getName (.getCurrentState instanceStateChange))))))
+               (.getName (.getCurrentState instanceStateChange))))
+    (if wait
+      (doseq [id ids]
+        (wait-for-instance-state id :terminated :verbose true)))))
 
 ;;;
 ;;; EC2 Security groups
@@ -859,6 +938,14 @@
               (do-indent 6)
               (print-ip-permission ipPermission))))))))
                      
+(defn vpc-instances
+  "Return a (possibly empty) sequence of Instances in the specified VPC."
+  [vpc-id]
+  (describeInstancesResult->instances 
+   (.describeInstances
+    (ec2) (doto (DescribeInstancesRequest.)
+            (.setFilters [(Filter. "vpc-id" [vpc-id])])))))
+
 (defn report-vpc-instances
   "Print summary of instances in vpcs, grouped by vpc."
   []
@@ -872,12 +959,35 @@
                (str "dflt=" (.isDefault vpc))
                (squish-tags (.getTags vpc)))
       ;; Instances in the vpc
-      (let [describeInstancesResult
-            (.describeInstances
-             ec2 (doto (DescribeInstancesRequest.)
-                   (.setFilters [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
+      (if-let [instances (not-empty? (vpc-instances (.getVpcId vpc)))]
         (binding [*indent* (+ *indent* 4)]
-          (report-instances :data describeInstancesResult :exclude #{:VpcId} :include #{:PrivateIpAddress}))))))
+          (report-instances :instances instances
+                            :exclude #{:VpcId} :include #{:PrivateIpAddress}))))))
+
+(defn vpc-instance-at-address
+  "Return the Instance of an existing EC2 instance assigned the indicated address
+   in the indicated VPC, or nil if there is no such instance.
+
+   vpc-id should be a string id similar to 'vpc-b60efed3'.
+   ip-address should be a dotted ip V4 address as a string.
+
+   Note that the instance could be in a number of non-terminated states.  We
+   don't return an instance if for terminated (but information-available)
+   instances.
+
+   Right now this is overly general and could theoretically (but not in practice)
+   return a match because a public ip address matched a private ip address, etc.
+   So we ought to specify which type of address we're trying to match, but for now
+   we don't."
+  [vpc-id ip-address]
+  {:pre [(string? ip-address)]}
+  ;; Terminated instances won't have ip addresses, no need
+  ;; for further filtering.
+  (find-if (fn [instance]
+             (or (= (.getPrivateIpAddress instance) ip-address)
+                 (= (.getPublicIpAddress instance) ip-address)))
+           (vpc-instances vpc-id)))
+
 
 ;;;
 ;;; Auto-scaling stuff
@@ -1249,6 +1359,17 @@
           (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id))
           (println "... snapshot" snapshot-id "deleted")
           (println "Image deletion complete."))))))
+
+(defn image-exists?
+  "Return true if the specified security image ID exists, false if it does not."
+  [image-id]
+  ;; Throws if the image ID does not exist.
+  (try 
+    (let [result (describe-images :ids image-id)]
+      (= (count result) 1))
+    (catch Exception e false)))
+
+
 
 ;;;
 ;;; ELB
