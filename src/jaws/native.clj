@@ -491,6 +491,17 @@
     (and (> (count dns-name) 0)
          dns-name)))
 
+(defmulti  instance-public-ip-address
+  "Retrieve the public IP address for an instance or instance id,
+   return nil if there isn't one."
+  class)
+(defmethod instance-public-ip-address String [instance-id]
+  (instance-public-ip-address (first (describe-instances :ids instance-id))))
+(defmethod instance-public-ip-address Instance [instance]
+  (let [ip-address (.getPublicIpAddress instance)]
+    (and (> (count ip-address) 0)
+         ip-address)))
+
 (defn- sort-aws-tags
   "Given a sequence of Tags, 
    sort them lexicographically by key and value names unless there is a supplied
