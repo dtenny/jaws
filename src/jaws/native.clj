@@ -15,9 +15,10 @@
             DescribeAlarmsRequest])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
-            CreateImageRequest CreateTagsRequest
+            GetConsoleOutputRequest CreateImageRequest CreateTagsRequest
             DeleteSnapshotRequest DeregisterImageRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
+            DescribeInstanceStatusRequest
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
             Filter Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
@@ -395,6 +396,13 @@
     true
     (catch Exception e false)))
 
+(defn- squish-tags
+  "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
+   E.g. [Name=this is a tag description, ...]"
+  [tag-list]
+  (mapv (fn [tag] (str (.getKey tag) "=" (.getValue tag)))
+        (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
+
 (defn report-tags
   "Print tag information for any specific EC2 entity that can have tags.
    Specify the entity ID."
@@ -422,15 +430,138 @@
   (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
         tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
     (.createTags (ec2) (CreateTagsRequest. (listify entity) tags))))
-    
+
+;;;
+;;; EC2 - Filter construction
+;;;
 
+(defn make-ec2-filter
+  "Make and return an ec2.model.Filter given a key and value.
+   If key-map is specified, it must be a map
+   that is used to convert one key to another before placing it in the filter,
+   typically used to conver valid clojure keywords to keyword strings that aren't
+   valid as clojure keywords, but are valid as ec2 model Filters.
+
+   E.g. (make-ec2-filter :state :ready #{:state \"state.status\"})
+        => #<Filter>(\"state.status\", \"ready\")
+   The key-map can also specify other keywords as values, it doesn't have to be a string,
+   though it's more efficient that way."
+  [k v & [key-map]]
+  (let [k (or (and key-map (get key-map k)) k)]
+    (Filter. (cond (keyword? k) (name k)
+                   (string? k) k
+                   :else (throw (Exception.
+                                 (str "key " k " of type " (type k)
+                                      " cannot be converted to a Filter key."))))
+             [(cond (keyword? v) (name v)
+                    (integer? v) (int v)
+                    :else v)])))
+
+(defn- map->ec2-filters
+  "Given a map convert keys and values to Filter elements,
+   return a collection of ec2.mode.Filters
+   for use with setFilters(Collection<Filter>) on some ec2 model request.
+   If 'key-map' is specified, translate keys in 'm' before converting them to
+   Filter keys."
+  [m & [key-map]]
+  {:pre [(map? m)]}
+  (into '() (map (fn [e] (make-ec2-filter (key e) (val e) key-map)) (seq m))))
+
+
+;;;
+;;; EC2 - instance status
+;;;
+
+(def instance-state-code-map "Map of InstanceState codes to keywords"
+  {0 :pending, 16 :running, 32 :shutting-down, 48 :terminated, 64 :stopping, 80 :stopped})
+(def instance-statuses "Valid instance status values"
+  #{:ok :impaired :initializing :insufficient-data :not-applicable})
+(def instance-reachabilities "Valid instance reachability values"
+  #{:passed :failed :initializing :insufficient-data})
+
+(def describe-instance-status-filter-map
+  "Map filter keys for describe-instance-status to valid Filter anmes for the request."
+  {:az "availability-zone"
+   :event-code "event.code"
+   :event-description "event.description"
+   :event-not-after "event.not-after"
+   :event-not-before "event.not-before"
+   :instance-state "instance-state-name"
+   :instance-reachability "instance-status.reachability"
+   :instance-status "instance-status.status"
+   :system-reachability "system-status.reachability"
+   :system-status "system-status.status"
+   })
+   
+(defn describe-instance-status
+  "Return a sequence of InstanceStatus objects for EC2 instances.
+  :ids - instance ids (or collection thereof) to describe, default nil (all instances).
+  :all - if true include status for instances in states other than running.
+  :filters - map of attributes/values to filter on. Keys:
+           :az - availability zone of the instance
+           :event-code - instance-{reboot,retirement,stop}, system-{reboot,maintenance}
+           :event-description - event description
+           :event-not-after - latest end time for the scheduled event
+           :event-not-before - earliest start time for the scheduled event
+           :instance-state-code - key from instance-state-code-maap (e.g. 0)
+           :instance-state - one of the values in instance-state-code-map (e.g. :pending)
+           :instance-reachability - one of 'instance-reachabilities'
+           :instance-status:  - one of 'instance-statuses'
+           :system-reachability - one of 'instance-rechabilities'
+           :system-status - one of 'instance-statuses'"
+  [& {:keys [ids all filters]}]
+  (let [request (DescribeInstanceStatusRequest.)]
+    (if ids (.setInstanceIds request (listify ids)))
+    (if all (.setIncludeAllInstances request true))
+    (if filters
+      (.setFilters request (map->ec2-filters filters describe-instance-status-filter-map)))
+    (let [result (.describeInstanceStatus (ec2) request)]
+      (if (.getNextToken result)
+        (println "*FINISH*: pagination for missing entries in DescribeInstanceStatus"))
+      (.getInstanceStatuses result))))
+
+(defn report-instance-status
+  "Report details of InstanceStatus objects.
+   If no instance-statuses are specified, retrieve them as with describe-instance-status."
+  [& [instance-statuses]]
+  (let [instance-statuses (or instance-statuses (describe-instance-status))]
+    (doseq [status instance-statuses]
+      (println (.getInstanceId status)
+               (.getName (.getInstanceState status))
+               (.getAvailabilityZone status))
+      (doseq [event (.getEvents status)]
+        (println " " (.getCode event)
+                 (.getDescription event)
+                 "Not After:" (.getNotAfter event)
+                 "Not Before:" (.getNotBefore event)))
+      (let [i-status (.getInstanceStatus status)
+            s-status (.getSystemStatus status)
+            detail-fn (fn [details]
+                        (doseq [detail details]
+                          (println "   " (.getName detail) (.getStatus detail)
+                                   "impaired since:" (str (.getImpairedSince detail)))))]
+        (println "  Instance status: " (.getStatus i-status))
+        (detail-fn (.getDetails i-status))
+        (println "  System status: " (.getStatus s-status))
+        (detail-fn (.getDetails s-status))))))
+
+(defn report-problem-instances
+  "Wrapper around report-instance-status + describe-instance-status and some filters
+   to find instances we can't reach or that are otherwise known to have problems."
+  []
+  (let [instances
+        (into #{}                       ;filters duplicates
+              (concat (describe-instance-status :filters {:instance-reachability :failed})
+                      (describe-instance-status :filters {:system-reachability :failed})
+                      (describe-instance-status :filters {:instance-status :impaired})
+                      (describe-instance-status :filters {:system-status :impaired})))]
+    (report-instance-status instances)))
+
+
 ;;;
 ;;; EC2 - instance queries
 ;;;
 (declare describe-instances)
-
-(def instance-state-code-map "Map of InstanceState codes to keywords"
-  {0 :pending, 16 :running, 32 :shutting-down, 48 :terminated, 64 :stopping, 80 :stopped})
 
 (defmulti  instance-state
     "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
@@ -526,13 +657,6 @@
                                       [(.getKey tag2) (.getValue tag2)]))))]
     (sort comp tag-list)))
 
-(defn- squish-tags
-  "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
-   E.g. [Name=this is a tag description, ...]"
-  [tag-list]
-  (mapv (fn [tag] (str (.getKey tag) "=" (.getValue tag)))
-        (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
-
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object.
    Often called implicitly via:
@@ -573,6 +697,8 @@
 ;; *TBD*: List valid keywords for fields if an improper one is given, right now we silently ignore it.
 ;; *TBD*: Consider implicit merging of :instances and :instance-ids as we do in {start,stop,terminate}-instances.
 ;; and eliminate one or the other of those keywords.
+;; *TBD*: consider DescribeInstanceStatus merging with this function, so we can report
+;; unreachable systems, etc, on the instance report.
 (defn report-instances 
   "Print a information about instances.
    The default is to print one line of information per instance, unless options
@@ -882,6 +1008,12 @@
       (doseq [id ids]
         (wait-for-instance-state id :terminated :verbose true)))))
 
+(defn instance-console-output
+  "Retrieve the console output of an instance given an instance ID"
+  [instance-id]
+  (->> (.getConsoleOutput (ec2) (GetConsoleOutputRequest. instance-id))
+       (.getDecodedOutput)))
+
 ;;;
 ;;; EC2 Security groups
 ;;; 
