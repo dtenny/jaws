@@ -396,6 +396,30 @@
     true
     (catch Exception e false)))
 
+(defn- sort-aws-tags
+  "Given a sequence of Tags, 
+   sort them lexicographically by key and value names unless there is a supplied
+   collection of key strings, in which case the order of keys in the collection
+   will be used as the sort order for any keys in map entries.  Tag keys whose names aren't
+
+   Example (sort-aws-tags (#Tag<:key foo :value bar> #Tag<:key Name :value fred>) [\"Name\"])
+           => (#Tag<:key Name :value fred> #Tag<:key foo :value bar>)
+   Normally the map with :key 'foo' would come first"
+  [tag-list preferred-keys]
+  (let [keysmap (if preferred-keys
+                  (into {} (for [x (range (count preferred-keys))] [(nth preferred-keys x) x]))
+                  {})
+        comp (fn [tag1 tag2]
+               (let [p1 (get keysmap (.getKey tag1)) ;'p' for priority
+                     p2 (get keysmap (.getKey tag2))]
+                 (cond (and p1 p2) (compare [p1 (.getValue tag1)] [p2 (.getValue tag2)])
+                       p1 -1               ;prioritied key sorts < nonprioritied key
+                       p2 1                ;nonprioritied key is > prioritied key
+                       ;; Neither map has a priority key
+                       :else (compare [(.getKey tag1) (.getValue tag1)]
+                                      [(.getKey tag2) (.getValue tag2)]))))]
+    (sort comp tag-list)))
+
 (defn- squish-tags
   "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
    E.g. [Name=this is a tag description, ...]"
@@ -530,7 +554,8 @@
                (.getName (.getInstanceState status))
                (.getAvailabilityZone status))
       (doseq [event (.getEvents status)]
-        (println " " (.getCode event)
+        (println "  Events:")
+        (println "   " (.getCode event)
                  (.getDescription event)
                  "Not After:" (.getNotAfter event)
                  "Not Before:" (.getNotBefore event)))
@@ -632,30 +657,6 @@
   (let [ip-address (.getPublicIpAddress instance)]
     (and (> (count ip-address) 0)
          ip-address)))
-
-(defn- sort-aws-tags
-  "Given a sequence of Tags, 
-   sort them lexicographically by key and value names unless there is a supplied
-   collection of key strings, in which case the order of keys in the collection
-   will be used as the sort order for any keys in map entries.  Tag keys whose names aren't
-
-   Example (sort-aws-tags (#Tag<:key foo :value bar> #Tag<:key Name :value fred>) [\"Name\"])
-           => (#Tag<:key Name :value fred> #Tag<:key foo :value bar>)
-   Normally the map with :key 'foo' would come first"
-  [tag-list preferred-keys]
-  (let [keysmap (if preferred-keys
-                  (into {} (for [x (range (count preferred-keys))] [(nth preferred-keys x) x]))
-                  {})
-        comp (fn [tag1 tag2]
-               (let [p1 (get keysmap (.getKey tag1)) ;'p' for priority
-                     p2 (get keysmap (.getKey tag2))]
-                 (cond (and p1 p2) (compare [p1 (.getValue tag1)] [p2 (.getValue tag2)])
-                       p1 -1               ;prioritied key sorts < nonprioritied key
-                       p2 1                ;nonprioritied key is > prioritied key
-                       ;; Neither map has a priority key
-                       :else (compare [(.getKey tag1) (.getValue tag1)]
-                                      [(.getKey tag2) (.getValue tag2)]))))]
-    (sort comp tag-list)))
 
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object.
