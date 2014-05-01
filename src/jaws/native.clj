@@ -668,6 +668,11 @@
        (map (fn [mapping] (.getEbs mapping)))
        (map (fn [dev] (.getVolumeId dev)))))
 
+(defn instance-availability-zone
+  "Return the availability zone of an Instance"
+  [instance]
+  (.getAvailabilityZone (.getPlacement instance)))
+
 (defn describeInstancesResult->instances
   "Convert DescribeInsancesResult objects to a sequence of instances.
    The argument may be a singleton DescribeInstancesResult or a collection of them."

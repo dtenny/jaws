@@ -1,4 +1,5 @@
 (ns jaws.scribe
+  (:require [clojure.java.io :as io])
   (:use clojure.repl)
   (:use clojure.set)
   (:use [jdt core cl shell easyfs ssh])
@@ -132,6 +133,39 @@
           (printlines (scribe-ssh dnsname (str "echo $(hostname) ; " scribe-counters)))
           (flush))))
     (println "SSH output for" (count instances) "instances in /tmp/counters-prod.out")))
+
+(defn counters-prod-parallel
+  "Get scribe_ctrl countesr from all production scribe relays.
+   Return a collection of file names containing the results."
+  []
+  (let [instances
+        (filter #(= (instance-state %) :running) (scribe-all-production-instances))
+        file-timestamp (date->utc)
+        fetcher-fn
+        (fn [instance]
+          (let [relay-name (get-autoscaling-groupname instance)
+                file-name (str "/tmp/" file-timestamp "-" 
+                               (instance-availability-zone instance) "-"
+                               relay-name)
+                dns-name (.getPublicDnsName instance)]
+            (with-open [out (io/writer file-name)]
+              (binding [*out* out]
+                (let [[rc stdout err] (scribe-ssh dns-name scribe-counters)]
+                  (if-not (= rc 0)
+                    (cl-format *err* "** ERROR collecting counters from ~a~%~a~%"
+                               dns-name err))
+                  (printlines stdout))
+                (flush)))
+            file-name))
+        start-time (System/currentTimeMillis)
+        result (map deref
+                    (doall
+                     (map #(future (fetcher-fn %))
+                          instances)))]
+    (println (count result) "instances queried in"
+             (- (System/currentTimeMillis) start-time) "ms")
+    result))
+
 
 ;; Note that we can derive regions for instances from availability zones, which is in the Placement object from instance.getPlacement()
 
