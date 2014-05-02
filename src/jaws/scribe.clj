@@ -166,6 +166,34 @@
              (- (System/currentTimeMillis) start-time) "ms")
     result))
 
+;; TODO: need to save the reference to the ScheduledExecutorService so we can
+;; invoke shutdown on it.  May want to return vector of both that and the ScheduledFuture,
+;; since right now we'll be leaking a (single) thread pool on every call.
+(defn every-n-minutes
+  "Run fn asynchronously every n minutes.
+   Returns the ScheduledFuture on which you can call (.cancel <result> true).
+
+   Recommend 'fn' have *out* and *err* bound to some well known location.
+   Also recommend you save the returned ScheduledFuture so you don't have un-reclaimable
+   daemon threads running."
+  [fn n]
+  (let [scheduled-executor-service
+        (java.util.concurrent.Executors/newSingleThreadScheduledExecutor)]
+    (.scheduleAtFixedRate scheduled-executor-service
+                          fn 0 n java.util.concurrent.TimeUnit/MINUTES)))
+
+(defn repeat-counters-prod-parallel
+  "Retrieve production scribe counters every n-minutes minutes.
+   Save the ScheduledFuture result of this function so you can
+   (.cancel <sf> true) when you're done, or you'll have to exit the REPL to
+   stop collecting."
+  [n-minutes]
+  (every-n-minutes
+   (fn []
+     (println (date->utc) "collecting counters.")
+     (println (counters-prod-parallel))
+     (println))
+   n-minutes))
 
 ;; Note that we can derive regions for instances from availability zones, which is in the Placement object from instance.getPlacement()
 
