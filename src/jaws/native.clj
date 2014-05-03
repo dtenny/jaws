@@ -33,6 +33,26 @@
   (:import java.io.File))
 
 ;;;
+;;;
+;;; Fixes to jdt.core 0.1.0
+;;;
+(defn listify-safe                      ;-> listify, but that loses order of elements
+  "Similar to seqify, but ensures that the returned collection type is a List.
+   If x is a singleton datum, return a list of one element, x.
+   If x is a non-list collection return a list for it.
+   If x is a sequence, return it as a list.
+   Nil is given special treatment and is turned into an empty list
+   however false is not converted into an empty sequence.
+   Element order is retrained so that sorted inputs preserve their order."
+  [x]
+  (cond (list? x) x
+        (seq? x) (apply list x)
+        (coll? x) (apply list x)
+        (nil? x) ()
+        :else (list x)))
+
+
+;;;
 ;;; Conventions
 ;;;
 ;;; Functions named 'describe-*' or 'list-*' are named after AWS methods.
@@ -140,17 +160,17 @@
 ;; (which amazonica hides in a private atom), and so we can see the creds represented
 ;; as a keyword in cred-map isntead of something less intuitive.
 (defonce
-  ^{:private true :doc
+  ^{:private true :dynamic true :doc
     "Key in cred-map whose credentials we're using.
     A nil key means we're using whatever is in the calling process environment."}
-  current-cred-key (atom nil))
+  *current-cred-key* (atom nil))
 
 (defn current-cred-map-entry
   "Return the map entry in cred-map indicating current credentials in use
    or nil if there aren't any except those imposed by the process' calling environment
   (Which you can get with environment-creds)."
   []
-  (if-let [key (deref current-cred-key)]
+  (if-let [key (deref *current-cred-key*)]
     (find @cred-map key)))
 
 ;;DefaultAWSCredentialsProviderChain 	
@@ -172,9 +192,27 @@
   (defcred (prompt-for-credentials)) may be useful."
   [key]
   (if-let [creds (key @cred-map)]
-    (reset! current-cred-key key)
+    (reset! *current-cred-key* key)
     (throw (Exception. (str "Invalid cred-map key: " key)))))
   
+(defn call-with-cred
+  "Dynamically bind the current AWS credentials to the specified credential key
+   and execute function (taking no arguments) with the binding in effect.
+   The key must be a key in the 'cred-map'.
+   Example: (call-with-cred :foo #(println \"AWS user:\" (iam-get-user-account-number))).
+   Returns the value of fn."
+  [key fn]
+  (binding [*current-cred-key* (atom key)]
+    (fn)))
+
+(defmacro with-cred
+  "Dynamically bind the current AWS credentials to the specified credential key
+   and execut body with the binding in effect.  The key must be a key in the 'cred-map'.
+   Example: (with-cred :foo (println \"AWS user:\" (iam-get-user-account-number)))
+   Returns the value of body."
+  [key & body]
+  `(call-with-cred ~key (fn [] ~@body)))
+
 (defn choose-creds
   "Interactive selectiobn and activataion of credentials for future AWS interaction."
   []
@@ -185,7 +223,7 @@
   "Make some flavor of aws credentials such as BasicAWSCredentials from previously selected credentials
    and return them. Complain if credentials haven't been set with (choose-creds) or similar mechanism."
   []
-  (if-not @current-cred-key
+  (if-not @*current-cred-key*
     (throw (Exception. "Credentials have not been set, use (choose-creds) or (defcred)")))
   (let [current-creds (val (current-cred-map-entry))]
     (BasicAWSCredentials. (first current-creds) (second current-creds))))
@@ -199,7 +237,7 @@
     (println "  Old:" old-creds)
     (println "  New:" credvalue)
     (do (reset! cred-map (assoc @cred-map credkey credvalue))
-        (when (= credkey @current-cred-key)
+        (when (= credkey @*current-cred-key*)
           (println "Using new AWS credentials")))))
 
 (defonce
@@ -453,7 +491,7 @@
   {:pre [(map? tag-map)]}
   (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
         tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
-    (.createTags (ec2) (CreateTagsRequest. (listify entity) tags))))
+    (.createTags (ec2) (CreateTagsRequest. (listify-safe entity) tags))))
 
 ;;;
 ;;; EC2 - Filter construction
@@ -504,7 +542,7 @@
   #{:passed :failed :initializing :insufficient-data})
 
 (def describe-instance-status-filter-map
-  "Map filter keys for describe-instance-status to valid Filter anmes for the request."
+  "Map filter keys for describe-instance-status to valid Filter names for the request."
   {:az "availability-zone"
    :event-code "event.code"
    :event-description "event.description"
@@ -535,7 +573,7 @@
            :system-status - one of 'instance-statuses'"
   [& {:keys [ids all filters]}]
   (let [request (DescribeInstanceStatusRequest.)]
-    (if ids (.setInstanceIds request (listify ids)))
+    (if ids (.setInstanceIds request (listify-safe ids)))
     (if all (.setIncludeAllInstances request true))
     (if filters
       (.setFilters request (map->ec2-filters filters describe-instance-status-filter-map)))
@@ -912,8 +950,8 @@
         request (RunInstancesRequest. ami-id min max)]
     (.setInstanceType request type)
     (if keyname (.setKeyName request keyname))
-    (if group-ids (.setSecurityGroupIds request (listify group-ids)))
-    (if group-names (.setSecurityGroups request (listify group-names)))
+    (if group-ids (.setSecurityGroupIds request (listify-safe group-ids)))
+    (if group-names (.setSecurityGroups request (listify-safe group-names)))
     (if private-ip-address (.setPrivateIpAddress request private-ip-address))
     (if subnet (.setSubnetId request subnet))
     (let [run-fn (fn [] (->> (.runInstances (ec2 region) request)
@@ -951,7 +989,7 @@
   [ids & {:keys [region wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (map instance-id (listify ids))]
+  (let [ids (map instance-id (listify-safe ids))]
     (doseq [instanceStateChange 
             (->> (.startInstances (ec2 region) (StartInstancesRequest. ids))
                  (.getStartingInstances))]
@@ -973,7 +1011,7 @@
   [ids & {:keys [region wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (map instance-id (listify ids))]
+  (let [ids (map instance-id (listify-safe ids))]
     (doseq [instanceStateChange 
             (->> (.stopInstances (ec2 region) (StopInstancesRequest. ids))
                  (.getStoppingInstances))]
@@ -996,7 +1034,7 @@
   [ids & {:keys [region force wait]
           :or {region *region*}}]
   {:pre [(not (= region :all))]}
-  (let [ids (map instance-id (listify ids))]
+  (let [ids (map instance-id (listify-safe ids))]
     (if force
       (doseq [id ids]
         (.modifyInstanceAttribute (ec2 region)
@@ -1294,6 +1332,8 @@
     (println)))
 
 
+;; Early Testing
+#_
 (defn ec2-describe-all-images
   []
   (let [ec2 (ec2)]
@@ -1308,6 +1348,8 @@
       #_ (doseq [image images] (println (str image))) ; /tmp/native-images
       )))
 
+;; Early testing
+#_
 (defn ec2-describe-some-images
   []
   (let [ec2 (ec2)
@@ -1348,13 +1390,43 @@
               Can be one of the following, or a list of the following:
               :self or \"self\", where self is the sender of the request,
               :all or \"all\",
-              or a string or numeric AWS account ID."
-  ;; *TODO: Filters
-  [& {:keys [ids owned-by exec-by]}]
+              or a string or numeric AWS account ID.
+   :filters - map of attributes/values to filter on.  Key (k/v can be keyword, string, or other for vals).
+      architecture - The image architecture (i386 | x86_64).
+      block-device-mapping.delete-on-termination - A Boolean value that indicates whether the Amazon EBS volume is deleted on instance termination.
+      block-device-mapping.device-name - The device name for the Amazon EBS volume (for example, /dev/sdh).
+      block-device-mapping.snapshot-id - The ID of the snapshot used for the Amazon EBS volume.
+      block-device-mapping.volume-size - The volume size of the Amazon EBS volume, in GiB.
+      block-device-mapping.volume-type - The volume type of the Amazon EBS volume (standard | io1).
+      description - The description of the image (provided during image creation).
+      hypervisor - The hypervisor type (ovm | xen).
+      image-id - The ID of the image.
+      image-type - The image type (machine | kernel | ramdisk).
+      is-public - A Boolean that indicates whether the image is public.
+      kernel-id - The kernel ID.
+      manifest-location - The location of the image manifest.
+      name - The name of the AMI (provided during image creation).
+      owner-alias - The AWS account alias (for example, amazon).
+      owner-id - The AWS account ID of the image owner.
+      platform - The platform. To only list Windows-based AMIs, use windows.
+      product-code - The product code.
+      product-code.type - The type of the product code (devpay | marketplace).
+      ramdisk-id - The RAM disk ID.
+      root-device-name - The name of the root device volume (for example, /dev/sda1).
+      root-device-type - The type of the root device volume (ebs | instance-store).
+      state - The state of the image (available | pending | failed).
+      state-reason-code - The reason code for the state change.
+      state-reason-message - The message for the state change.
+      tag:key=value - The key/value combination of a tag assigned to the resource.
+      tag-key - The key of a tag assigned to the resource.
+      tag-value - The value of a tag assigned to the resource.
+      virtualization-type - The virtualization type (paravirtual | hvm). "
+  [& {:keys [ids owned-by exec-by filters]}]
   (let [request (DescribeImagesRequest.)]
-    (if ids (.setImageIds request (listify ids)))
-    (if owned-by (.setOwners request (keys-n-stuff->strings (listify owned-by))))
-    (if exec-by (.setExecutableUsers request (keys-n-stuff->strings (listify exec-by))))
+    (if ids (.setImageIds request (listify-safe ids)))
+    (if owned-by (.setOwners request (keys-n-stuff->strings (listify-safe owned-by))))
+    (if exec-by (.setExecutableUsers request (keys-n-stuff->strings (listify-safe exec-by))))
+    (if filters (.setFilters request (map->ec2-filters filters)))
     (seq (.getImages (.describeImages (ec2) request)))))
 
 (defn report-images
@@ -1386,7 +1458,7 @@
    
   (let [fetched-images (if (or (not images) ids)
                          (describe-images :ids ids :owned-by owned-by :exec-by exec-by))
-        images (concat (listify images) fetched-images)
+        images (concat (listify-safe images) fetched-images)
         fields (difference (union fields include) exclude)]
     (doseq [image images]
       (pu (.getImageId image))
@@ -1556,8 +1628,8 @@
       :or {fields #{:Name :Vpc :DnsName :Scheme :Subnets :Sgs :SourceSg}
            include #{} exclude #{}}}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
-  (let [names (listify names)
-        descs (listify descs)
+  (let [names (listify-safe names)
+        descs (listify-safe descs)
         descs (or (not-empty?
                    (concat (and names (apply describe-elbs names)) descs))
                   (describe-elbs))
