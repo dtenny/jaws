@@ -460,7 +460,10 @@
 
 (defn- squish-tags
   "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
-   E.g. [Name=this is a tag description, ...]"
+   E.g. [Name=this is a tag description, ...]
+
+   Note that the result of this function is better printed with 'pr' or 'prn'
+   rather than 'print' or 'println' so that strings are quoted."
   [tag-list]
   (mapv (fn [tag] (str (.getKey tag) "=" (.getValue tag)))
         (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
@@ -486,11 +489,15 @@
    Specify the entity ID (or list of entity IDs) and a map of tag key/value pairs.
    Strings and vals are assumed strings, however keywords are acceptable
    in which case their names will be used.
+   If verbose is true, print a message about the tags being assigned to the entity.
    Returns nil."
-  [entity tag-map]
+  [entity tag-map & {:keys [verbose]}]
   {:pre [(map? tag-map)]}
   (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
         tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
+    (when verbose
+      (print "Tagging" entity "with ")
+      (prn (squish-tags tags)))
     (.createTags (ec2) (CreateTagsRequest. (listify-safe entity) tags))))
 
 ;;;
