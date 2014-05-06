@@ -20,6 +20,7 @@
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeInstanceStatusRequest
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
+            DescribeVpcsRequest
             Filter Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
             ModifyImageAttributeRequest ModifyInstanceAttributeRequest RunInstancesRequest
@@ -757,7 +758,7 @@
 
    Options:
    :indent all lines with the indicated (minimum) number of leading spaces
-           indentation desired (default zero).  note that secondary lines (if
+           indentation desired (default *indent*).  note that secondary lines (if
            more than one line per instance is printed) are indented an
            additional indent-incr spaces.
    :indent-incr amount to additionally indent secondary data lines (for
@@ -1100,6 +1101,62 @@
            "ranges" (seq (.getIpRanges ip-permission))
            "to port" (.getToPort ip-permission)
            "id grps" (seq (.getUserIdGroupPairs ip-permission))))
+
+(defn describe-vpcs
+ "Return a list of Vpc objects.
+  Options:
+    :ids - a vpc id or sequence of vpc ids, if unspecified all vpcs will be listed.
+    :filters - map of attributes/values to filter on.  Key (k/v can be keyword, string, or other for vals).
+      cidr - The CIDR block of the VPC. The CIDR block you specify must exactly match the VPC's CIDR block for information to be returned for the VPC.
+      dhcp-options-id - The ID of a set of DHCP options.
+      isDefault - Indicates whether the VPC is the default VPC.
+      state - The state of the VPC (pending | available).
+      tag:key=value - The key/value combination of a tag assigned to the resource.
+      tag-key - The key of a tag assigned to the resource. 
+      tag-value - The value of a tag assigned to the resource."
+ [& {:keys [ids filters]}]
+ (let [request (DescribeVpcsRequest.)]
+   (if ids (.setVpcIds request (listify-safe ids)))
+   (if filters (.setFilters request (map->ec2-filters filters)))
+   (seq (.getVpcs (.describeVpcs (ec2) request)))))
+
+(defn report-vpcs
+  "Report on zero or more Vpc instances,
+  fetch them if non arespecified as with 'describe-vpcs'.
+
+  Options: 
+   :vpcs - a Vpc object, or collection of Vpc objects.
+   :ids - a vpc id, or collectio nof vpc ids.
+   :fields - set of fields to display in addition to the vpc id.
+             Defaults to #{:CidrBlock :IsDefault :State :Tags}.
+             Additional fields include: :DhcpOptionsId :InstanceTenancy
+   :include - Set of additional fields to display, defaults to #{}.
+   :exclude - Set of additional fields to exclude from the display, defauls to #{}.
+   :indent indent printed lines with the indicated (minimum) number of leading spaces
+           indentation desired (default *indent*).  note that secondary lines (if
+           more than one line per instance is printed) are indented an
+           additional indent-incr spaces.
+   :indent-incr amount to additionally indent secondary data lines (for
+                options where more than one line per instance is printed. Default 2.
+
+  Returns nil."
+  [& {:keys [vpcs ids fields include exclude indent indent-incr]
+      :or {fields #{:CidrBlock :IsDefault :State :Tags} include #{} exclude #{}
+           indent *indent* indent-incr 2}}]
+  {:pre [(set? include) (set? exclude) (set? fields)]}
+  (let [fetched-vpcs (if (or (not vpcs) ids) (describe-vpcs :ids ids))
+        vpcs (concat (listify-safe vpcs) fetched-vpcs)
+        fields (difference (union fields include) exclude)]
+    (doseq [vpc vpcs]
+      (do-indent indent)
+      (pu (.getVpcId vpc))
+      (pif (:CidrBlock fields) (.getCidrBlock vpc) pu)
+      (pif (:IsDefault fields) (.getIsDefault vpc) pu)
+      (pif (:State fields) (.getState vpc) pu)
+      (pif (:DhcpOptionsId fields) (.getDhcpOptionsId vpc) pu)
+      (pif (:InstanceTenancy fields) (.getInstanceTenancy vpc) pu)
+      (pif (:Tags fields) (squish-tags (.getTags vpc)) pq)
+      (println))))
 
 (defn report-vpc-sg-permissions
   []
