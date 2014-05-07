@@ -459,6 +459,13 @@
                                       [(.getKey tag2) (.getValue tag2)]))))]
     (sort comp tag-list)))
 
+(defn get-name-tag
+  "Return the tag value of a 'Name' tag from a sequence of Tag objects, or nil
+   if there isn't a Name tag in the sequence."
+  [tag-list]
+  (if-let [name-tag (find-if (fn [tag] (= (.getKey tag) "Name")) tag-list)]
+    (.getValue name-tag)))
+
 (defn- squish-tags
   "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
    E.g. [Name=this is a tag description, ...]
