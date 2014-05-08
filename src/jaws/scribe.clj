@@ -119,27 +119,13 @@
   (.getValue
    (first (filter #(= (.getKey %) "aws:autoscaling:groupName") (.getTags instance)))))
 
-(defn counters-prod
-  "Get scribe_ctrl countesr from all production scribe relays"
-  []
-  (let [instances
-        (filter #(= (instance-state %) :running) (scribe-all-production-instances))]
-    (with-output ["/tmp/counters-prod.out"]
-      (doseq [instance instances]
-        (let [dnsname (.getPublicDnsName instance)]
-          (println "scribe_ctrl counters for "
-                   (get-autoscaling-groupname instance) dnsname
-                   "at" (date->utc))
-          (printlines (scribe-ssh dnsname (str "echo $(hostname) ; " scribe-counters)))
-          (flush))))
-    (println "SSH output for" (count instances) "instances in /tmp/counters-prod.out")))
-
-(defn counters-prod-parallel
-  "Get scribe_ctrl countesr from all production scribe relays.
+(defn counters-parallel
+  "Get scribe_ctrl countesr from all scribe relays in 'instances', typically obtained via a call
+   to 'scribe-all-production-instances' or 'scribe-all-preproduction-instances'.
    Return a collection of file names containing the results."
-  []
+  [instances]
   (let [instances
-        (filter #(= (instance-state %) :running) (scribe-all-production-instances))
+        (filter #(= (instance-state %) :running) instances)
         file-timestamp (date->utc)
         fetcher-fn
         (fn [instance]
@@ -182,6 +168,20 @@
     (.scheduleAtFixedRate scheduled-executor-service
                           fn 0 n java.util.concurrent.TimeUnit/MINUTES)))
 
+(defn counters-prod
+  "Get scribe_ctrl counters from all production scribe relays"
+  []
+  (let [instances
+        (filter #(= (instance-state %) :running) (scribe-all-production-instances))]
+    (counters-parallel instances)))
+
+(defn counters-preprod
+  "Get scribe_ctrl counters from all preproduction scribe relays"
+  []
+  (let [instances
+        (filter #(= (instance-state %) :running) (scribe-all-preproduction-instances))]
+    (counters-parallel instances)))
+
 (defn repeat-counters-prod-parallel
   "Retrieve production scribe counters every n-minutes minutes.
    Save the ScheduledFuture result of this function so you can
@@ -191,7 +191,7 @@
   (every-n-minutes
    (fn []
      (println (date->utc) "collecting counters.")
-     (println (counters-prod-parallel))
+     (println (counters-prod))
      (println))
    n-minutes))
 
