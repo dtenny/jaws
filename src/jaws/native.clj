@@ -650,7 +650,12 @@
 (defmethod instance-state String [instance-id]
   (instance-state (first (describe-instances :ids instance-id))))
 (defmethod instance-state Instance [instance]
-  (get instance-state-code-map (.getCode (.getState instance)) :unknown-state-code))
+  (let [code (.getCode (.getState instance))
+        state (get instance-state-code-map code :unknown-state-code)]
+    (if (= state :unknown-state-code)
+      (do (comment (println "Oops: getState=" (.getState instance)));commented out for demo mode.
+          (str state "-" code))
+      state)))
 
 (defmulti  wait-for-instance-state
   "Wait for an instance to reach the designated instance state.
