@@ -119,6 +119,40 @@
   (.getValue
    (first (filter #(= (.getKey %) "aws:autoscaling:groupName") (.getTags instance)))))
 
+(defn ssh-parallel
+  "Invoke 'ssh-command' from all scribe relays in 'instances', typically obtained via a call
+   to 'scribe-all-production-instances' or 'scribe-all-preproduction-instances'.
+   Return a collection of file names containing the results."
+  [instances ssh-command]
+  (let [instances
+        (filter #(= (instance-state %) :running) instances)
+        file-timestamp (date->utc)
+        fetcher-fn
+        (fn [instance]
+          (let [relay-name (get-autoscaling-groupname instance)
+                file-name (str "/tmp/" file-timestamp "-" 
+                               (instance-availability-zone instance) "-"
+                               relay-name)
+                dns-name (.getPublicDnsName instance)]
+            (with-open [out (io/writer file-name)]
+              (binding [*out* out]
+                (let [[rc stdout err] (scribe-ssh dns-name ssh-command)]
+                  (if-not (= rc 0)
+                    (cl-format *err* "** ERROR invoking ~s from ~a~%~a~%"
+                               ssh-command dns-name err))
+                  (printlines stdout))
+                (flush)))
+            file-name))
+        start-time (System/currentTimeMillis)
+        result (map deref
+                    (doall
+                     (map #(future (fetcher-fn %))
+                          instances)))]
+    (println (count result) "instances queried in"
+             (- (System/currentTimeMillis) start-time) "ms")
+    result))
+
+;; *TODO*: eliminate counters-parallel as calls to (ssh-parallel instances scribe-counterss)
 (defn counters-parallel
   "Get scribe_ctrl countesr from all scribe relays in 'instances', typically obtained via a call
    to 'scribe-all-production-instances' or 'scribe-all-preproduction-instances'.
@@ -181,6 +215,20 @@
   (let [instances
         (filter #(= (instance-state %) :running) (scribe-all-preproduction-instances))]
     (counters-parallel instances)))
+
+(defn ssh-prod
+  "Invoke the indicated ssh command on all produciton scribe relays"
+  [ssh-command]
+  (let [instances
+        (filter #(= (instance-state %) :running) (scribe-all-production-instances))]
+    (ssh-parallel instances ssh-command)))
+
+(defn ssh-preprod
+  "Invoke the indicated ssh command on all produciton scribe relays"
+  [ssh-command]
+  (let [instances
+        (filter #(= (instance-state %) :running) (scribe-all-preproduction-instances))]
+    (ssh-parallel instances ssh-command)))
 
 (defn repeat-counters-prod-parallel
   "Retrieve production scribe counters every n-minutes minutes.
