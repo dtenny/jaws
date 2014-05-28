@@ -1,4 +1,4 @@
-(defproject jaws "0.1.0"
+(defproject jaws "0.1.1-SNAPSHOT"
   :description "Some simple tool type wrappers for amazon aws JDK API"
   :url "http://example.com/FIXME"
   :license {:name "Eclipse Public License"

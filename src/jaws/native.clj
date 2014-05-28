@@ -11,7 +11,7 @@
   (:import [com.amazonaws.services.autoscaling AmazonAutoScalingClient])
   (:import [com.amazonaws.services.cloudwatch AmazonCloudWatchClient])
   (:import [com.amazonaws.services.cloudwatch.model
-            DescribeAlarmsRequest])
+            DescribeAlarmsRequest ListMetricsRequest])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             GetConsoleOutputRequest CreateImageRequest CreateTagsRequest
@@ -1783,6 +1783,70 @@
        (.setRegion cw region)
        cw)))
 
+
+(defn- get-metrics-lazy
+  "Fetch all metrics in paged fashion as a lazy sequence.
+   'cw' is an AmazonCloudWatchClient instance.
+   'result' is the seq of Metrics gathered so far.
+   'nt' is the nextToken to fetch."
+  [cw result nt]
+  ;;(println "nt=" (str "'" nt "'") "cnt=" (count result))
+  (if (and nt (> (count nt) 0))
+    (concat result
+            (lazy-seq 
+             (let [metrics-result (.listMetrics
+                                 cw (doto (ListMetricsRequest.) (.setNextToken nt)))]
+               (get-metrics-lazy cw (.getMetrics metrics-result)
+                                (.getNextToken metrics-result)))))
+    result))
+
+(def aws-metric-namespaces
+  "Known 'AWS/<x>' namespaces per
+   http://docs.aws.amazon.com/AmazonCloudWatch/latest/DeveloperGuide/aws-namespaces.html
+   Unfortunately I don't know an API dedicated to returning this information,
+   or the custom namespaces.  We'd have to clean it from all namespaces listed for
+   all metrics which is expensive.  See 'get-all-metric-namespaces.'"
+  (for [name 
+        ["AutoScaling" "Billing" "DynamoDB" "ElastiCache" "EBS" "EC2" "ELB" "ElasticMapReduce"
+         "OpsWorks" "Redshift" "RDS" "Route53" "SNS" "SQS" "SWF" "StorageGateway"]]
+    (str "AWS/" name)))
+
+(defn describe-metrics
+  "Retrieve Metric instances.
+   Options:
+    :namespace - string specifying a namespace (no globs allowed)
+                 whose metrics we're interested in. See 'get-all-metric-namespaces'
+                 if you're not sure what those (namespaces) might be."
+  ;; *TODO*: need filtering options
+  [& {:keys [namespace]}]
+  (let [cw (cw)
+        request (ListMetricsRequest.)]
+    (if namespace
+      (.setNamespace request namespace))
+    (let [metric-result (.listMetrics cw request)]
+      (get-metrics-lazy cw (.getMetrics metric-result) (.getNextToken metric-result)))))
+
+(defn get-all-metric-namespaces
+  "Retrieve a set of all metric namespaces (in the current region)
+   the hard (expensive) way.  For a set of precomputed 'standard' AWS namespaces
+   see 'aws-metric-namespaces'."
+  []
+  (into #{}
+    (map (fn [metric] (.getNamespace metric))
+         (describe-metrics))))
+
+(defn report-metrics
+  "Report on zero or more Metric instances, fetch them if non are specified as with 'describe-metrics'.
+  :instances a collection of Metric instances, optional."
+  [& {:keys [instances]}]
+  (let [instances (or instances (describe-metrics))]
+    (doseq [metric instances]
+      (print (.getMetricName metric)
+             (.getNamespace metric))
+      (doseq [dimension (.getDimensions metric)]
+        (cl-format true " ~a=~a" (.getName dimension) (.getValue dimension)))
+      (println))))
+
 ;; (take 125 (describe-alarms-nonlazy)) - verify # batches fetched
 (defn- get-alarms-nonlazy
   "Fetch all alarms in paged fashion, as a non-lazy sequence.
@@ -1838,7 +1902,7 @@
 
 (defn report-alarms
   "Report on zero or more MetricAlarm instances, fetch them if none are specified as with 'describe-alarms'.
-  :instances A collectionof MetricAlarm instances, optional."
+  :instances A collection of MetricAlarm instances, optional."
   [& {:keys [instances]}]
   ;; Note: non-lazy took 17.4 secs, lazy took 18.3 secs, for 1761 alarms
   ;; in 50 record batches (the default).  Could be normal statistical/network variance.
