@@ -61,3 +61,19 @@
                  (add-cred-file file :foo)
                  (use-cred :foo))))
   (is (= (count @cred-map) 0)))
+
+(deftest test-validate-defn-keywords
+  (letfn [(foo [& {:keys [a b c] :as all-keys}]
+            (validate-defn-keywords all-keys '[a b c])
+            (validate-defn-keywords all-keys 'a 'b 'c)
+            (validate-defn-keywords all-keys :a 'b {:c 1})
+            (validate-defn-keywords all-keys :a ['b] {'c 1})
+            (validate-defn-keywords all-keys #{:a 'b "c"}))]
+    (foo :a 1)
+    (foo :b 2)
+    (foo :c 3)
+    (is (thrown? IllegalArgumentException (foo :d 4)))
+    (is (thrown? IllegalArgumentException (foo :c 3 :d 4)))))
+
+
+

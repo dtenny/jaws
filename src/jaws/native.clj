@@ -660,10 +660,7 @@
          ip-address)))
 
 (defn instance-volume-ids
-  "Return a collection of ebs volume IDs attached to an Instance object.
-   Often called implicitly via:
-   (report-instances :instances (old-describe-instances :tag-regex #\"(?i)created\")
-                                :fields #{:VolumeIds})"
+  "Return a collection of ebs volume IDs attached to an Instance object."
   [instance]
   (->> (.getBlockDeviceMappings instance)
        (map (fn [mapping] (.getEbs mapping)))
@@ -688,13 +685,179 @@
                 (re-find regex (.getValue tag))))
           (seq (.getTags taggable)))))
 
-;; *TODO*: note that Filter _values_ can have '*' (zero or more chars) and '?' (one or more chars), as per
-;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
-;; Filter value matching is case sensitive (hence pretty limited, particularly since there's no disjunction).
-;; Note: wildcard and baskslash chars must be escaped with backslashes.
-;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
-;; *TBD*: need filters of some kind (pre or post) that match any interesting field,
-;; not just tags. (userdata, description, instance name, sg names, etc)
+(def describe-instances-filters
+  "A map whose keys are valid filter names for describe-instances
+   and whose values serve as documentation on the respective keys.
+   This was generated based on AWS SDK 1.8.8 and may not reflect the complete
+   list of valid filters."
+  {:architecture "The instance architecture (i386 | x86_64)."
+   :availability-zone "The Availability Zone of the instance."
+   :block-device-mapping.attach-time
+   "The attach time for an Amazon EBS volume mapped to the instance."
+   :block-device-mapping.delete-on-termination
+   "A Boolean that indicates whether the Amazon EBS volume is deleted on
+    instance termination."
+   :block-device-mapping.device-name
+   "The device name for the Amazon EBS volume (for example, /dev/sdh)."
+   :block-device-mapping.status
+   "The status for the Amazon EBS volume (attaching | attached | detaching | detached)."
+   :block-device-mapping.volume-id "The volume ID of the Amazon EBS volume."
+   :client-token "The idempotency token you provided when you launched the instance."
+   :dns-name "The public DNS name of the instance."
+   :group-id
+   "The ID of the security group for the instance. If the instance is in
+    EC2-Classic or a default VPC, you can use group-name instead."
+   :group-name
+   "The name of the security group for the instance. If the instance is in a
+    nondefault VPC, you must use group-id instead."
+   :hypervisor "The hypervisor type of the instance (ovm | xen)."
+   :iam-instance-profile.arn
+   "The instance profile associated with the instance. Specified as an ARN."
+   :image-id "The ID of the image used to launch the instance."
+   :instance-id "The ID of the instance."
+   :instance-lifecycle "Indicates whether this is a Spot Instance (spot)."
+   :instance-state-code
+   "The state of the instance, as a 16-bit unsigned integer. The high byte is
+    an opaque internal value and should be ignored. The low byte is set based
+    on the state represented. The valid values are: 0 (pending), 16 (running),
+    32 (shutting-down), 48 (terminated), 64 (stopping), and 80 (stopped)."
+   :instance-state-name
+   "The state of the instance
+    (pending | running | shutting-down | terminated | stopping | stopped)."
+   :instance-type "The type of instance (for example, m1.small)."
+   :instance.group-id
+   "The ID of the security group for the instance. If the instance is in
+    EC2-Classic or a default VPC, you can use instance.group-name instead."
+   :instance.group-name
+   "The name of the security group for the instance. If the instance is in a
+    nondefault VPC, you must use instance.group-id instead."
+   :ip-address "The public IP address of the instance."
+   :kernel-id "The kernel ID."
+   :key-name "The name of the key pair used when the instance was launched."
+   :launch-index
+   "When launching multiple instances, this is the index for the instance in
+    the launch group (for example, 0, 1, 2, and so on)."
+   :launch-time "The time when the instance was launched."
+   :monitoring-state "whether instance monitoring is enabled (disabled | enabled)."
+   :owner-id "The AWS account ID of the instance owner."
+   :placement-group-name "The name of the placement group for the instance."
+   :platform "The platform. Use windows if you have Windows instances otherwise leave blank."
+   :private-dns-name "The private DNS name of the instance."
+   :private-ip-address "The private IP address of the instance."
+   :product-code "The product code associated with the AMI used to launch the instance."
+   :product-code.type "The type of product code (devpay | marketplace)."
+   :ramdisk-id "The RAM disk ID."
+   :reason
+   "The reason for the current state of the instance (for example,
+    shows \"User Initiated [date]\" when you stop or terminate the instance).
+    Similar to the state-reason-code filter."
+   :requester-id
+   "The ID of the entity that launched the instance on your behalf (for example,
+    AWS Management Console, Auto Scaling, and so on)."
+   :reservation-id "The ID of the instance's reservation."
+   :root-device-name "Name of instance root device (for example, /dev/sda1)."
+   :root-device-type "Type of instance root device (ebs | instance-store)."
+   :source-dest-check
+   "Indicates whether the instance performs source/destination checking. A value
+    of true means that checking is enabled, and false means checking is disabled.
+    The value must be false for the instance to perform network address translation
+    (NAT) in your VPC."
+   :spot-instance-request-id "The ID of the Spot Instance request."
+   :state-reason-code "The reason code for the state change."
+   :state-reason-message "A message that describes the state change."
+   :subnet-id "The ID of the subnet for the instance."
+   :tag:key=value
+   "The key/value combination of a tag assigned to the resource,
+    where tag:key is the tag's key.  This filter key is poorly documented.
+    Actual usage example for Creator=dtenny k/v tag: {:tag:Creator \"dtenny\"}"
+   :tag-key
+   "The key of a tag assigned to the resource. This filter is independent of the
+    tag-value filter. For example, if you use both the filter \"tag-key=Purpose\"
+    and the filter \"tag-value=X\", you get any resources assigned both the tag
+    key Purpose (regardless of what the tag's value is), and the tag value X
+    (regardless of what the tag's key is). If you want to list only resources
+    where Purpose is X, see the tag:key=value filter."
+   :tag-value
+   "The value of a tag assigned to the resource. This filter is independent
+    of the tag-key filter."
+   :tenancy "The tenancy of an instance (dedicated | default)."
+   :virtualization-type "The virtualization type of the instance (paravirtual | hvm)."
+   :vpc-id "The ID of the VPC that the instance is running in."
+   :network-interface.description "The description of the network interface."
+   :network-interface.subnet-id "The ID of the subnet for the network interface."
+   :network-interface.vpc-id "The ID of the VPC for the network interface."
+   :network-interface.network-interface.id "The ID of the network interface."
+   :network-interface.owner-id "The ID of the owner of the network interface."
+   :network-interface.availability-zone "Availability Zone for the network interface."
+   :network-interface.requester-id "The requester ID for the network interface."
+   :network-interface.requester-managed "Whether the network interface is managed by AWS."
+   :network-interface.status "The status of the network interface (available) | in-use)."
+   :network-interface.mac-address "The MAC address of the network interface."
+   :network-interface-private-dns-name "The private DNS name of the network interface."
+   :network-interface.source-destination-check
+   "Whether the network interface performs source/destination checking.
+    A value of true means checking is enabled, and false means checking is
+    disabled. The value must be false for the network interface to perform
+    network address translation (NAT) in your VPC."
+   :network-interface.group-id "Security group ID associated with the network interface."
+   :network-interface.group-name "Security group name associated with the network interface."
+   :network-interface.attachment.attachment-id "The ID of the interface attachment."
+   :network-interface.attachment.instance-id
+   "Instance ID to which the network interface is attached."
+   :network-interface.attachment.instance-owner-id
+   "The owner ID of the instance to which the network interface is attached."
+   :network-interface.addresses.private-ip-address
+   "The private IP address associated with the network interface."
+   :network-interface.attachment.device-index
+   "The device index to which the network interface is attached."
+   :network-interface.attachment.status
+   "The status of the attachment (attaching | attached | detaching | detached)."
+   :network-interface.attachment.attach-time
+   "The time that the network interface was attached to an instance."
+   :network-interface.attachment.delete-on-termination
+   "Specifies whether the attachment is deleted when an instance is terminated."
+   :network-interface.addresses.primary
+   "Specifies whether the IP address of the network interface is the
+    primary private IP address."
+   :network-interface.addresses.association.public-ip
+   "The ID of the association of an Elastic IP address with a network interface."
+   :network-interface.addresses.association.ip-owner-id
+   "The owner ID of the private IP address associated with the network interface."
+   :association.public-ip "Elastic IP address bound to the network interface."
+   :association.ip-owner-id
+   "The owner of the Elastic IP address associated with the network interface."
+   :association.allocation-id
+   "The allocation ID returned when you allocated the Elastic IP address
+    for your network interface."
+   :association.association-id
+   "The association ID returned when the network interface was associated
+    with an IP address."
+   })
+
+(defn describe-instances-filters-key? [keyword]
+  "Given a keyword intended to match a keyword in the 'describe-instances-filters' map
+   return true if it is a valid keyword in the map, or nil otherwise, with special
+   treatment for the :tag:<key>=<value> syntax that is not literally matched."
+  (let [s (name keyword)]
+    (if (.startsWith s "tag:")
+      true
+      (get describe-instances-filters keyword))))
+
+(defn describeInstancesResult->instances
+  "Convert DescribeInsancesResult objects to a sequence of instances.
+   The argument may be a singleton DescribeInstancesResult or a collection of them."
+  [results]
+  (->> (seqify results)
+       flatten
+       (map (fn [describeInstancesResult]
+              (seq (.getReservations describeInstancesResult))))
+       ;; Sometimes there are no reservations ina DescribeInstancesResult (get null)
+       ;; E.g. on filtered requests.
+       (filter identity)
+       flatten
+       (map (fn [reservation] (seq (.getInstances reservation))))
+       flatten))
+
 (defn old-describe-instances
   "Retrieve zero or more Instances with various filters and regions applied.
    Returns a collection that can be fed as :data to 'report-instances', e.g.
@@ -709,6 +872,7 @@
               'matches' operation. '(?i)' may be useful in your regex to ignore case.
               Note that tag regexes must filter tags after retrieval from amazon."
   [& {:keys [region tag-regex ids]}]
+  (print "**WARNING** Deprecated: old-describe-instances")
   (let [regions (regions-for-key region)
         fetch-fn (if ids
                    (let [ids (map name (listify ids))]
@@ -728,175 +892,178 @@
          (filter tag-regex-fn)
          )))
 
+;; jdt.core candidate
+;;; See also test-validate-defn-keywords in native_test.clj
+(defn validate-defn-keywords
+  "Given a map of keyword/value pairs specify to a function call to a function
+   declared with a map, e.g. (defn foo [& {:keys [a b c] :as all-keys}])
+
+   Throw IllegalArgumentException if any keywords in
+   all-keys aren't in the parameters named by valid-keys.
+
+   This function is useful because functions declared like 'foo' above
+   will accept other keywords without complaint.
+
+   This function is NOT efficient, it conses up a lot of crap because it's flexible
+   on the arguments it takes.  If we simplified the calling assumptions we could
+   make it much more efficient.  For now it's meant to be convenient to use, typically
+   for those functions that are used frequently in interactiev REPL contexts where
+   typos or otherwise incorrect keyword names are common.
+
+   'all-keys-map' is the :as parameter name for keywords in a 'defn'.
+
+   'valid-keys' keywords (or symbols or strings that will be coerced to keywords)
+   or collections of same representing valid keywords. 
+
+   Any key in all-keys-map that isn't in valid-keys will trigger an exception.
+
+   Example based on the above 'foo' declaration in docstring,
+   the following are all equivalent validators for arguments passed to foo:
+ 
+       (validate-defn-keywords all-keys :a :b :c)
+       (validate-defn-keywords all-keys '[a b c])
+       (validate-defn-keywords all-keys {:a 1 :b 2 :c 3})
+       (validate-defn-keywords all-keys {:a 1 :b 2} :c)
+   "
+  [all-keys-map & valid-keys]
+  (let [make-key (fn [x] (if (keyword? x) x (keyword (name x))))
+        plain-keys (into [] (map make-key (filter #(not (coll? %)) valid-keys)))
+        collections-of-keys
+        (into [] 
+          (map (fn [c]
+                 (if (map? c)
+                   (into #{} (map make-key (keys c)))
+                   (into #{} (map make-key (seq c)))))
+               (filter #(coll? %) valid-keys)))]
+    (doseq [e all-keys-map]
+      (let [k (key e)]
+        (if-not (or (some #(= k %) plain-keys)
+                    (some #(contains? % k) collections-of-keys))
+          (throw (IllegalArgumentException.
+                  (str "Keyword " k " is not a valid parameter in the calling function."
+                       "\nValid keys are: "
+                       ;; map seq because flatten doesn't so sets/maps
+                       (pr-str
+                        (flatten (conj (map seq collections-of-keys) plain-keys)))))))))))
+
+(defn- describe-instances-lazy
+  "Helper routine for lazy paged fetch support for describe-instances.
+   'ec2' is the AmazonEC2Client.
+   'result' is the seq of Instances so gathered so far.
+   'request' is the DescribeInstancesRequest.
+   'nextToken' is the next token to fetch.
+   'post-filter-fn' is a function that filters the 'result' seq.
+   It can be nil if there is no filtering to be done."
+  [ec2 result request nextToken post-filter-fn]
+  #_(println "**DEBUG** describe-tags-lazy: nextToken="
+           (str "'" nextToken "'") "count=" (count result))
+  (if (and nextToken (> (count nextToken) 0)) ; nonempty string
+    (concat result
+            (lazy-seq
+             (let [describeInstancesResult
+                   (.describeInstances
+                    ec2 (doto request (.setNextToken nextToken)))]
+               (describe-instances-lazy
+                ec2  (describeInstancesResult->instances describeInstancesResult)
+                request (.getNextToken describeInstancesResult) post-filter-fn))))
+    (if post-filter-fn
+      (filter post-filter-fn result)
+      result)))
+
 (defn describe-instances
   "Return a sequence of Instance objects, typically useful in conjunction with
    'report-instances' via the :instances argument to that function.
 
-   Options:
-   :ids - an instance id or seq of instance ids.
-   :filters - map of attributes/values to filter on.
-              Key (k/v can be keyword, string, or other for vals).
-              Valid filters include:
-      architecture - The instance architecture (i386 | x86_64).
-      availability-zone - The Availability Zone of the instance.
-      block-device-mapping.attach-time
-          - The attach time for an Amazon EBS volume mapped to the instance.
-      block-device-mapping.delete-on-termination
-          - A Boolean that indicates whether the Amazon EBS volume is deleted on
-            instance termination.
-      block-device-mapping.device-name
-          - The device name for the Amazon EBS volume (for example, /dev/sdh).
-      block-device-mapping.status
-          - The status for the Amazon EBS volume
-            (attaching | attached | detaching | detached).
-      block-device-mapping.volume-id - The volume ID of the Amazon EBS volume.
-      client-token - The idempotency token you provided when you launched the instance.
-      dns-name - The public DNS name of the instance.
-      group-id
-          - The ID of the security group for the instance. If the instance is in
-            EC2-Classic or a default VPC, you can use group-name instead.
-      group-name
-          - The name of the security group for the instance. If the instance is in a
-            nondefault VPC, you must use group-id instead.
-      hypervisor - The hypervisor type of the instance (ovm | xen).
-      iam-instance-profile.arn
-          - The instance profile associated with the instance. Specified as an ARN.
-      image-id - The ID of the image used to launch the instance.
-      instance-id - The ID of the instance.
-      instance-lifecycle - Indicates whether this is a Spot Instance (spot).
-      instance-state-code
-          - The state of the instance, as a 16-bit unsigned integer. The high byte is
-            an opaque internal value and should be ignored. The low byte is set based
-            on the state represented. The valid values are: 0 (pending), 16 (running),
-            32 (shutting-down), 48 (terminated), 64 (stopping), and 80 (stopped).
-      instance-state-name
-          - The state of the instance
-            (pending | running | shutting-down | terminated | stopping | stopped).
-      instance-type - The type of instance (for example, m1.small).
-      instance.group-id
-          - The ID of the security group for the instance. If the instance is in
-            EC2-Classic or a default VPC, you can use instance.group-name instead.
-      instance.group-name
-          - The name of the security group for the instance. If the instance is in a
-            nondefault VPC, you must use instance.group-id instead.
-      ip-address - The public IP address of the instance.
-      kernel-id - The kernel ID.
-      key-name - The name of the key pair used when the instance was launched.
-      launch-index
-          - When launching multiple instances, this is the index for the instance in
-            the launch group (for example, 0, 1, 2, and so on).
-      launch-time - The time when the instance was launched.
-      monitoring-state - whether instance monitoring is enabled (disabled | enabled).
-      owner-id - The AWS account ID of the instance owner.
-      placement-group-name - The name of the placement group for the instance.
-      platform
-          - The platform. Use windows if you have Windows instances otherwise leave blank.
-      private-dns-name - The private DNS name of the instance.
-      private-ip-address - The private IP address of the instance.
-      product-code - The product code associated with the AMI used to launch the instance.
-      product-code.type - The type of product code (devpay | marketplace).
-      ramdisk-id - The RAM disk ID.
-      reason
-          - The reason for the current state of the instance (for example,
-            shows \"User Initiated [date]\" when you stop or terminate the instance).
-            Similar to the state-reason-code filter.
-      requester-id
-          - The ID of the entity that launched the instance on your behalf (for example,
-            AWS Management Console, Auto Scaling, and so on).
-      reservation-id - The ID of the instance's reservation.
-      root-device-name - Name of instance root device (for example, /dev/sda1).
-      root-device-type - Type of instance root device (ebs | instance-store).
-      source-dest-check
-        - Indicates whether the instance performs source/destination checking. A value
-          of true means that checking is enabled, and false means checking is disabled.
-          The value must be false for the instance to perform network address translation
-          (NAT) in your VPC.
-      spot-instance-request-id - The ID of the Spot Instance request.
-      state-reason-code - The reason code for the state change.
-      state-reason-message - A message that describes the state change.
-      subnet-id - The ID of the subnet for the instance.
-      tag:key=value
-          - The key/value combination of a tag assigned to the resource,
-            where tag:key is the tag's key.
-      tag-key
-          - The key of a tag assigned to the resource. This filter is independent of the
-            tag-value filter. For example, if you use both the filter \"tag-key=Purpose\"
-            and the filter \"tag-value=X\", you get any resources assigned both the tag
-            key Purpose (regardless of what the tag's value is), and the tag value X
-            (regardless of what the tag's key is). If you want to list only resources
-            where Purpose is X, see the tag:key=value filter.
-      tag-value
-          - The value of a tag assigned to the resource. This filter is independent
-            of the tag-key filter.
-      tenancy - The tenancy of an instance (dedicated | default).
-      virtualization-type - The virtualization type of the instance (paravirtual | hvm).
-      vpc-id - The ID of the VPC that the instance is running in.
-      network-interface.description - The description of the network interface.
-      network-interface.subnet-id - The ID of the subnet for the network interface.
-      network-interface.vpc-id - The ID of the VPC for the network interface.
-      network-interface.network-interface.id - The ID of the network interface.
-      network-interface.owner-id - The ID of the owner of the network interface.
-      network-interface.availability-zone - Availability Zone for the network interface.
-      network-interface.requester-id - The requester ID for the network interface.
-      network-interface.requester-managed - Whether the network interface is managed by AWS.
-      network-interface.status - The status of the network interface (available) | in-use).
-      network-interface.mac-address - The MAC address of the network interface.
-      network-interface-private-dns-name - The private DNS name of the network interface.
-      network-interface.source-destination-check
-          - Whether the network interface performs source/destination checking.
-            A value of true means checking is enabled, and false means checking is
-            disabled. The value must be false for the network interface to perform
-            network address translation (NAT) in your VPC.
-      network-interface.group-id - Security group ID associated with the network interface.
-      network-interface.group-name - Security group name associated with the network interface.
-      network-interface.attachment.attachment-id - The ID of the interface attachment.
-      network-interface.attachment.instance-id
-          - Instance ID to which the network interface is attached.
-      network-interface.attachment.instance-owner-id
-          - The owner ID of the instance to which the network interface is attached.
-      network-interface.addresses.private-ip-address
-          - The private IP address associated with the network interface.
-      network-interface.attachment.device-index
-          - The device index to which the network interface is attached.
-      network-interface.attachment.status
-          - The status of the attachment (attaching | attached | detaching | detached).
-      network-interface.attachment.attach-time
-          - The time that the network interface was attached to an instance.
-      network-interface.attachment.delete-on-termination
-          - Specifies whether the attachment is deleted when an instance is terminated.
-      network-interface.addresses.primary
-          - Specifies whether the IP address of the network interface is the
-            primary private IP address.
-      network-interface.addresses.association.public-ip
-          - The ID of the association of an Elastic IP address with a network interface.
-      network-interface.addresses.association.ip-owner-id
-          - The owner ID of the private IP address associated with the network interface.
-      association.public-ip - Elastic IP address bound to the network interface.
-      association.ip-owner-id
-          - The owner of the Elastic IP address associated with the network interface.
-      association.allocation-id
-          - The allocation ID returned when you allocated the Elastic IP address
-            for your network interface.
-      association.association-id
-          - The association ID returned when the network interface was associated
-            with an IP address. "
-  []
-  (println "*FINISH* describe-instances"))
+   Note that this function differs from the SDK API in that you can't specify
+   multiple Filter objects for the same key, if that's a problem you may need
+   to use the API directly.
 
-(defn describeInstancesResult->instances
-  "Convert DescribeInsancesResult objects to a sequence of instances.
-   The argument may be a singleton DescribeInstancesResult or a collection of them."
-  [results]
-  (->> (seqify results)
-       flatten
-       (map (fn [describeInstancesResult]
-              (seq (.getReservations describeInstancesResult))))
-       ;; Sometimes there are no reservations ina DescribeInstancesResult (get null)
-       ;; E.g. on filtered requests.
-       (filter identity)
-       flatten
-       (map (fn [reservation] (seq (.getInstances reservation))))
-       flatten))
+   Options:
+
+   :ids - An instance id or seq of instance ids.
+
+   :help - Print out the list of valid filters if true, and ignore other arguments.
+
+   :filters
+      A Map of attribute names or values to filter on.
+      Attribute names (keys) can be keywords or strings (assume case sensitive).
+      Attribute values can take on a wider set of types.  Any Keyword values
+      are converted to strings on the keyword name.
+      A single key/attribute-name can have multiple values.
+
+      Note that filter names and values can use the wildcards '*' (zero or more chars)
+      and '?' (zero or one char), and should escape those characers with a backslash
+      otherwise.  Filter matches are case sensitive in the SDK API
+      (unlike the AWS web console).
+
+      Filter examples:
+
+        :filters {:instance-id :i-333249ff}  (you could juse use :ids for this)
+        :filters {:instance-id [:i-333249ff \"i-3339ab33\"]}
+        :filters {:tag-value \"dtenny\"}
+        :filters {:key-name \"dtenny*\"}
+
+      And now for a tricky example because it's poorly documented for the supposed
+      tag:key=value filter name:
+
+        :filters {:tag:Creator \"dtenny\"}
+ 
+      To find instances with the tag/value combo of Creator=dtenny.
+
+      See 'describe-instances-filters' or use the :help argument
+      for a complete list of filters.
+
+   :tag-regex
+      A regular expression (java.util.regex.Pattern) applied to tag names and
+      values as a post-query filter. Instances lacking the regex will not be returned.
+      Instances are only returned if the regex passes a 'find', not a
+      'matches' operation. '(?i)' may be useful in your regex to ignore case."
+
+  [& {:keys [ids help filters tag-regex]
+      :or   {filters {}}
+      :as   all-keys
+      }]
+  (validate-defn-keywords all-keys '[ids help filters tag-regex])
+  (if help
+    (doseq [e describe-instances-filters]
+      (println (key e))
+      (println "   " (val e)))
+    (let [tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex))
+          request (DescribeInstancesRequest.)
+          keyword (fn [x] (keyword? x) x (keyword x))
+          ec2-filters
+          (map (fn [e]
+                 (let [filter-key (key e)]
+                   (if-not (describe-instances-filters-key? (keyword filter-key))
+                     (println "**WARNING**: UNKNOWN FILTER:" filter-key))
+                   (Filter. (name filter-key)
+                            (map (fn [v]
+                                   (if (instance? clojure.lang.Named v)
+                                     (name v)
+                                     v))
+                                 (listify (val e))))))
+               (seq filters))]
+
+      ;; These two exceptions seem spurious, I don't *always* get them when I set
+      ;; max results with the things they complain about
+      ;;
+      ;; AmazonServiceException The parameter 'maxResults' cannot be used with tag filters in the parameter 'filterSet'. Remove either the tag filters from 'filterSet' or the 'maxResults' parameter and try again. (Service: AmazonEC2; Status Code: 400; Error Code: InvalidParameterCombination; Request ID: c3d1ae82-d8df-45bf-8c52-c8e185a19e9e)  com.amazonaws.http.AmazonHttpClient.handleErrorResponse (AmazonHttpClient.java:937)
+      ;; AmazonServiceException The parameter instancesSet cannot be used with the parameter maxResults (Service: AmazonEC2; Status Code: 400; Error Code: InvalidParameterCombination; Request ID: 322fbf3d-5b36-4c21-b03e-f230b5bb6f91)  com.amazonaws.http.AmazonHttpClient.handleErrorResponse (AmazonHttpClient.java:937)
+      (if-not (or ids
+                  (some (fn [k] (.startsWith k "tag"))
+                        (map #(.getName %) ec2-filters)))
+        (.setMaxResults request (int 1000))) ; max 1000
+
+      (if ids
+        (.setInstanceIds request (map name (listify ids))))
+      (if-not (empty? ec2-filters)
+        (.setFilters request ec2-filters))
+      (let [ec2 (ec2)
+            describeInstancesResult (.describeInstances ec2 request)]
+        (describe-instances-lazy
+         ec2 (describeInstancesResult->instances describeInstancesResult)
+         request (.getNextToken describeInstancesResult)
+         tag-regex-fn)))))
 
 ;; Some stupid report printing functions & macros
 (defn- pu "print unquoted/friendly, ie. ~a" [x] (print x) (print " "))
@@ -908,8 +1075,6 @@
      (let [val# ~val]
        (~print-fn val#))))
 
-;; *TBD*: might like to know what AutoScalingLaunchConfig was used to launch an instance, 
-;; but this is only available via an DescribeAutoScalingInstancesResult.
 ;; *TBD*: List valid keywords for fields if an improper one is given, right now we silently ignore it.
 ;; *TBD*: Consider implicit merging of :instances and :instance-ids as we do in {start,stop,terminate}-instances.
 ;; and eliminate one or the other of those keywords.
@@ -927,18 +1092,12 @@
            additional indent-incr spaces.
    :indent-incr amount to additionally indent secondary data lines (for
                 options where more than one line per instance is printed. Default 2.
-   :data A DescribeInstancesResult object or collection of those objects to
-         be reported upon.  If neither this nor :instances is specified,
-         (old-describe-instances) is called to retrieve data.
-   :instances An Instance collection of instances.  If neither this nor :data
+   :instances An Instance or collection thereof.  If neither this nor :ids
               is speciied, (describe-instances is called to retrieve data.
               If both are specified, the resulting instances from each field are used
               (all together).  Note that you can turn instance IDs to instances
               via 'describe-instances'.
    :ids An instance ID or collection thereof, passed to 'describe-instances'.
-   :region a region keyword from 'region-map', or :all, in which case
-           iff :data is unspecified, data will be fetched from all regions.
-           :region is ignored if :data is specified.
    :fields Set of fields (information) to display in addition to instance id.
            Defaults to: #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
            Additional fields include: :VolumeIds, :InstanceProfile, :LaunchTime, :StoreType
@@ -951,20 +1110,14 @@
                 Rather pointless if you use the last field as a split field, unless you want a blank line
                 between each instance' report.  JDT likes :InstanceType for this keyword.
    Note that presently you can't specify the order of fields."
-  [& {:keys [data instances ids vpc-mode region indent indent-incr fields include exclude split-after]
+  [& {:keys [instances ids vpc-mode indent indent-incr fields include exclude split-after]
       :or {indent *indent* indent-incr 2
            fields #{:ImageId :VpcId :SubnetId :PublicDnsName :KeyName :State :InstanceType :SecurityGroups :Tags}
            include #{} exclude #{} }}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
-  (let [instances1 (and data (describeInstancesResult->instances data))
-        instances2 (and instances (seqify instances))
-        instances2a (and ids (old-describe-instances :ids ids))
-        instances3 (concat instances1 instances2 instances2a)
-        instances4 (if (empty? instances3)
-                       (describeInstancesResult->instances
-                        (map #(.describeInstances (ec2 %))
-                             (regions-for-key region)))
-                       instances3)
+  (let [instances2 (and instances (seqify instances))
+        instances2a (and ids (describe-instances :ids ids))
+        instances3 (concat instances2 instances2a)
         fields (difference (union fields include) exclude)
         split-after (into #{} (seqify split-after))
         sp (fn [x] (when (split-after x)
@@ -974,7 +1127,7 @@
               (when (get fields key)
                 (printfn val)
                 (sp key)))]
-    (doseq [instance instances4]
+    (doseq [instance instances3]
       (do-indent indent)
       (pu (.getInstanceId instance))
       ;; Convert to pure iteration on fields and reflection call? 
