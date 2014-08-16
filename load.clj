@@ -1,4 +1,5 @@
 (load-file "src/jaws/core.clj")
 (load-file "src/jaws/native.clj")
 (load-file "src/jaws/scribe.clj")
-;; (ns jaws.scribe)
+(jaws.native/load-jdt-cred-files)
+;; (ns jaws.native)

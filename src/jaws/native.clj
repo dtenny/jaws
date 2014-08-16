@@ -15,15 +15,18 @@
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
             GetConsoleOutputRequest CreateImageRequest CreateTagsRequest
-            DeleteSnapshotRequest DeregisterImageRequest
+            DeleteSnapshotRequest DeleteTagsRequest DeregisterImageRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
             DescribeInstanceStatusRequest
-            DescribeKeyPairsRequest DescribeSecurityGroupsRequest DescribeTagsRequest
-            DescribeVpcsRequest
+            DescribeKeyPairsRequest DescribeSecurityGroupsRequest
+            DescribeSnapshotsRequest DescribeSubnetsRequest DescribeTagsRequest
+            DescribeVolumesRequest DescribeVpcsRequest
             Filter Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
             ModifyImageAttributeRequest ModifyInstanceAttributeRequest RunInstancesRequest
-            StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest])
+            Snapshot
+            StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest
+            Volume])
   (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
   (:import [com.amazonaws.services.elasticloadbalancing.model DescribeLoadBalancersRequest])
   (:import [com.amazonaws.services.identitymanagement AmazonIdentityManagementClient])
@@ -55,8 +58,19 @@
                 (Region/getRegion region-enum)])
              (seq (Regions/values)))))
 
-(def ^{:dynamic true :doc "Keyword indicating desired region for operations that don't otherwise specify a region."}
+(def valid-regions "Valid values for *region*" (into #{} (keys region-map)))
+
+(defonce
+  ^{:dynamic true
+    :doc "Default AWS endpoint (region).  Must be one of 'valid-regions'."}
   *region* :us-east-1)
+
+(defn set-region!
+  "Call alter-var-root on *region* to change the default region for the calling thread.
+   Region value must be one of 'valid-regions'."
+  [region]
+  {:pre [(valid-regions region)]}
+  (alter-var-root #'*region* (constantly region)))
 
 (defn regions-for-key
   "Return a collection of regions (usually one) for some region-keyword from
@@ -191,6 +205,43 @@
                (map (fn [role] (.getRoleName role)) (.getRoles ip))))))
 
 
+
+;;;
+;;; AWS identifers based on string content
+;;;
+
+(defn instance-id?
+  "Return a string representing the instance id of the
+   keyword or string identifier, nil otherwise.
+   E.g. (instance-id? :i-50131f00) => \"i-50131f00\""
+  [id]
+  (re-matches #"i-\p{XDigit}{8}" (name id)))
+
+(defn security-group-id?
+  "Return a string representing the security group id of the
+   keyword or string identifier, nil otherwise."
+  [id]
+  (re-matches #"sg-\p{XDigit}{8}" (name id)))
+
+(defn snapshot-id?
+  "Return a string representing the snapshot id of the
+   keyword or string identifier, nil otherwise."
+  [id]
+  (re-matches #"snap-\p{XDigit}{8}" (name id)))
+
+(defn ami-id?
+  "Return a string representing the AMI id of the
+   keyword or string identifier, nil otherwise."
+  [id]
+  (re-matches #"ami-\p{XDigit}{8}" (name id)))
+
+(defn volume-id?
+  "Return a string representing the AMI id of the
+   keyword or string identifier, nil otherwise."
+  [id]
+  (re-matches #"vol-\p{XDigit}{8}" (name id)))
+
+
 ;;;
 ;;; EC2 - General
 ;;;
@@ -220,7 +271,7 @@
   [group-id]
   ;; Throws if the group does not exist.
   (try 
-    (let [result (.describeSecurityGroups (ec2)
+    (let [result (.describeSecurityGroups(ec2)
                                           (doto (DescribeSecurityGroupsRequest.)
                                             (.setGroupIds [group-id])))]
       (>= (count (.getSecurityGroups result)) 1))
@@ -271,7 +322,7 @@
     (.getValue name-tag)))
 
 (defn- squish-tags
-  "Tag a list of tags and compress them into a single vector of strings of the form 'key=val'.
+  "Take a list of tags and compress them into a single vector of strings of the form 'key=val'.
    E.g. [Name=this is a tag description, ...]
 
    Note that the result of this function is better printed with 'pr' or 'prn'
@@ -280,21 +331,75 @@
   (mapv (fn [tag] (str (.getKey tag) "=" (.getValue tag)))
         (sort-aws-tags tag-list ["Name" "aws:autoscaling:groupName"])))
 
+(defn- describe-tags-lazy
+  "Helper routine to fetch tags in paged fashion as a lazy sequence.
+   'ec2' is the AmazonEC2Client.
+   'result' is the seq of Tags so gathered so far.
+   'request' is the DescribeTagsRequest.
+   'nextToken' is the next token to fetch."
+  [ec2 result request nextToken]
+  #_(println "**DEBUG** describe-tags-lazy: nextToken="
+           (str "'" nextToken "'") "count=" (count result))
+  (if (and nextToken (> (count nextToken) 0)) ; nonempty string
+    (concat result
+            (lazy-seq
+             (let [describeTagsResult
+                   (.describeTags ec2
+                                  (doto request (.setNextToken nextToken)))]
+               (describe-tags-lazy ec2 (.getTags describeTagsResult)
+                                   (.getNextToken describeTagsResult)))))
+    result))
+
+(defn describe-tags
+  "Retrieve Tags known to the account as a lazy sequence.
+
+   Optionally filter for resource ids, tag keys, values, or entity resource types.
+   Any option may be a singleton or a seq/collection of strings or keywords.
+
+   Valid resource types: (customer-gateway | dhcp-options | image | instance |
+   internet-gateway | network-acl | network-interface | reserved-instances |
+   route-table | security-group | snapshot | spot-instances-request | subnet |
+   volume | vpc | vpn-connection | vpn-gateway).
+
+   e.g. (describe-tags :resource-ids \"i-50131f00\")
+
+   Note: WILDCARDS, escape with \\
+     '*' matches zero or more chars.
+     '?' matches exactly one char.
+
+   Note: searches are case sensitive.
+
+   Returns a list of Tag objects."
+  [& {:keys [resource-ids keys values resource-types]}]
+  (let [request (DescribeTagsRequest.)
+        filters (filter identity
+                   [
+                    (if resource-ids
+                      (Filter. "resource-id" (map #(name %) (listify resource-ids))))
+                    (if keys
+                      (Filter. "key" (map #(name %) (listify keys))))
+                    (if values
+                      (Filter. "value" (map #(name %) (listify values))))
+                    (if resource-types
+                      (Filter. "resource-type" (map #(name %) (listify resource-types))))
+                    ])]
+    (if filters
+      (.setFilters request filters))
+    (let [ec2 (ec2)
+          describeTagsResult (.describeTags ec2 request)]
+      (describe-tags-lazy ec2 (.getTags describeTagsResult) request
+                          (.getNextToken describeTagsResult)))))
+
 (defn report-tags
-  "Print tag information for any specific EC2 entity that can have tags.
-   Specify the entity ID."
-  [entity]
-  (let [result (.describeTags (ec2)
-                 (doto (DescribeTagsRequest.)
-                   (.setFilters [(Filter. "resource-id" [entity])])))
-        tagDescriptions (.getTags result)]
-    (if (empty? tagDescriptions)
-      (println "No tags exist for" entity)
-      (doseq [tagDescription tagDescriptions]
-        (println (.getResourceId tagDescription)
-                 (.getKey tagDescription)
-                 (.getResourceType tagDescription)
-                 (.getValue tagDescription))))))
+  "Print tag information for TagDesciption objects retrieved via describe-tags.
+   See describe-tags."
+  [tag-descriptions]
+  (doseq [tag-description tag-descriptions]
+    (print (.getResourceId tag-description)
+           (.getResourceType tag-description))
+    (print " ")
+    (prn (.getKey tag-description)
+         (.getValue tag-description))))
   
 (defn create-tags
   "Create tags for any specific EC2 entity that can have tags.
@@ -302,15 +407,37 @@
    Strings and vals are assumed strings, however keywords are acceptable
    in which case their names will be used.
    If verbose is true, print a message about the tags being assigned to the entity.
+
+   Restrictions:
+     Keys limited to 127 unicode chars, case sensitive, cannot start withy 'aws:'
+     Values limited to 255 unicode chars, case sensitive.
+
    Returns nil."
   [entity tag-map & {:keys [verbose]}]
   {:pre [(map? tag-map)]}
+  ;; Note: Could probably eliminate 'strify' in favor of 'name'
   (let [strify (fn [x] (if (keyword? x) (name x) (str x)))
         tags (map (fn [e] (Tag. (strify (key e)) (strify (val e)))) tag-map)]
     (when verbose
       (print "Tagging" entity "with ")
       (prn (squish-tags tags)))
-    (.createTags (ec2) (CreateTagsRequest. (listify entity) tags))))
+    (.createTags (ec2) (CreateTagsRequest. (map name (listify entity)) tags))))
+
+(defn delete-tags
+  "Delete specific tags for specific EC2 entity or entities that can have tags.
+   Specify the entity ID (or list of entity IDs) and a collection of tag name strings or keywords.
+   If verbose is true, print a message about the tags being deleted from the entity.
+   Returns nil."
+  ;; Note, this function doesn't presently allow you to delete based on tag values,
+  ;; but DeleteTagsRequest will allow that.
+  [entities tags & {:keys [verbose]}]
+  (let [tags (map #(Tag. %) (map name (listify tags)))
+        entities (map name (listify entities))]
+    (when verbose
+      (println "Removing tags" tags "from" entities))
+    (.deleteTags (ec2) (doto (DeleteTagsRequest. entities)
+                         (.setTags tags)))))
+                         
 
 ;;;
 ;;; EC2 - Filter construction
@@ -443,7 +570,18 @@
 ;;;
 ;;; EC2 - instance queries
 ;;;
-(declare describe-instances)
+(defn get-instance
+  "Retrieve Instance given ID or nil if the Instance doesn't exist.
+   Id may be string or keyword."
+  [instance-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getInstances
+            (first (.getReservations
+                    (.describeInstances (ec2) (doto (DescribeInstancesRequest.)
+                                                (.setInstanceIds [(name instance-id)])))))))
+    (catch AmazonServiceException e nil)))
+
 
 (defmulti  instance-state
     "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
@@ -452,7 +590,7 @@
      across successfive calls)."
     class)
 (defmethod instance-state String [instance-id]
-  (instance-state (first (describe-instances :ids instance-id))))
+  (instance-state (get-instance instance-id)))
 (defmethod instance-state Instance [instance]
   (let [code (.getCode (.getState instance))
         state (get instance-state-code-map code :unknown-state-code)]
@@ -495,6 +633,7 @@
   "Retrieve the instance id of an instance (or, if the argument is already an ID, return the identity."
   class)
 (defmethod instance-id String [instance-id] instance-id)
+(defmethod instance-id clojure.lang.Keyword [instance-id] (name instance-id))
 (defmethod instance-id Instance [instance] (.getInstanceId instance))
 
 (defmulti  instance-public-dns-name
@@ -503,7 +642,7 @@
    until the instance is in the :running state, and maybe not even then for VPC instances."
   class)
 (defmethod instance-public-dns-name String [instance-id]
-  (instance-public-dns-name (first (describe-instances :ids instance-id))))
+  (instance-public-dns-name (get-instance instance-id)))
 (defmethod instance-public-dns-name Instance [instance]
   (let [dns-name (.getPublicDnsName instance)]
     (and (> (count dns-name) 0)
@@ -514,7 +653,7 @@
    return nil if there isn't one."
   class)
 (defmethod instance-public-ip-address String [instance-id]
-  (instance-public-ip-address (first (describe-instances :ids instance-id))))
+  (instance-public-ip-address (get-instance instance-id)))
 (defmethod instance-public-ip-address Instance [instance]
   (let [ip-address (.getPublicIpAddress instance)]
     (and (> (count ip-address) 0)
@@ -523,7 +662,7 @@
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object.
    Often called implicitly via:
-   (report-instances :instances (describe-instances :tag-regex #\"(?i)created\")
+   (report-instances :instances (old-describe-instances :tag-regex #\"(?i)created\")
                                 :fields #{:VolumeIds})"
   [instance]
   (->> (.getBlockDeviceMappings instance)
@@ -534,6 +673,215 @@
   "Return the availability zone of an Instance"
   [instance]
   (.getAvailabilityZone (.getPlacement instance)))
+
+(defn- tag-regex-find-fn 
+  "Return a function of one argument that takes calls .getTags on the argument
+   the result of re-find if (re-find regex <x>) is true for either the tag key
+   or the tag value for any tag returned.  re-find is called on the key first, then the
+   value, it is not called on the value if the key test returns a logically
+   true value."
+  [regex]
+  {:pre [(instance? java.util.regex.Pattern regex)]}
+  (fn [taggable]
+    (some (fn [tag]
+            (or (re-find regex (.getKey tag))
+                (re-find regex (.getValue tag))))
+          (seq (.getTags taggable)))))
+
+;; *TODO*: note that Filter _values_ can have '*' (zero or more chars) and '?' (one or more chars), as per
+;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
+;; Filter value matching is case sensitive (hence pretty limited, particularly since there's no disjunction).
+;; Note: wildcard and baskslash chars must be escaped with backslashes.
+;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
+;; *TBD*: need filters of some kind (pre or post) that match any interesting field,
+;; not just tags. (userdata, description, instance name, sg names, etc)
+(defn old-describe-instances
+  "Retrieve zero or more Instances with various filters and regions applied.
+   Returns a collection that can be fed as :data to 'report-instances', e.g.
+   (report-instances :instances (old-describe-instances :tag-regex #\"(?i)created\"))
+   Options:
+   :region a region keyword from 'region-map', or :all to operate on all regions.
+   :ids a string or keyword instance ID, or collection/sequence of same, specifying specific instances
+        whose data should be retrieved.
+   :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
+              values as a filter.  Instances lacking the regex will not be returned.
+              Instances are only returned if the regex passes a 'find', not a
+              'matches' operation. '(?i)' may be useful in your regex to ignore case.
+              Note that tag regexes must filter tags after retrieval from amazon."
+  [& {:keys [region tag-regex ids]}]
+  (let [regions (regions-for-key region)
+        fetch-fn (if ids
+                   (let [ids (map name (listify ids))]
+                     (if (> (count ids) 0)
+                       (fn [region] (.describeInstances (ec2 region)
+                                                        (doto (DescribeInstancesRequest.)
+                                                          (.setInstanceIds ids))))
+                       (constantly nil)))
+                   (fn [region] (.describeInstances (ec2 region))))
+        tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
+    (->> (filter identity (map fetch-fn regions)) ;filter nils
+         flatten
+         (map (fn [descInsRes] (seq (.getReservations descInsRes))))
+         flatten
+         (map (fn [reservation] (seq (.getInstances reservation))))
+         flatten
+         (filter tag-regex-fn)
+         )))
+
+(defn describe-instances
+  "Return a sequence of Instance objects, typically useful in conjunction with
+   'report-instances' via the :instances argument to that function.
+
+   Options:
+   :ids - an instance id or seq of instance ids.
+   :filters - map of attributes/values to filter on.
+              Key (k/v can be keyword, string, or other for vals).
+              Valid filters include:
+      architecture - The instance architecture (i386 | x86_64).
+      availability-zone - The Availability Zone of the instance.
+      block-device-mapping.attach-time
+          - The attach time for an Amazon EBS volume mapped to the instance.
+      block-device-mapping.delete-on-termination
+          - A Boolean that indicates whether the Amazon EBS volume is deleted on
+            instance termination.
+      block-device-mapping.device-name
+          - The device name for the Amazon EBS volume (for example, /dev/sdh).
+      block-device-mapping.status
+          - The status for the Amazon EBS volume
+            (attaching | attached | detaching | detached).
+      block-device-mapping.volume-id - The volume ID of the Amazon EBS volume.
+      client-token - The idempotency token you provided when you launched the instance.
+      dns-name - The public DNS name of the instance.
+      group-id
+          - The ID of the security group for the instance. If the instance is in
+            EC2-Classic or a default VPC, you can use group-name instead.
+      group-name
+          - The name of the security group for the instance. If the instance is in a
+            nondefault VPC, you must use group-id instead.
+      hypervisor - The hypervisor type of the instance (ovm | xen).
+      iam-instance-profile.arn
+          - The instance profile associated with the instance. Specified as an ARN.
+      image-id - The ID of the image used to launch the instance.
+      instance-id - The ID of the instance.
+      instance-lifecycle - Indicates whether this is a Spot Instance (spot).
+      instance-state-code
+          - The state of the instance, as a 16-bit unsigned integer. The high byte is
+            an opaque internal value and should be ignored. The low byte is set based
+            on the state represented. The valid values are: 0 (pending), 16 (running),
+            32 (shutting-down), 48 (terminated), 64 (stopping), and 80 (stopped).
+      instance-state-name
+          - The state of the instance
+            (pending | running | shutting-down | terminated | stopping | stopped).
+      instance-type - The type of instance (for example, m1.small).
+      instance.group-id
+          - The ID of the security group for the instance. If the instance is in
+            EC2-Classic or a default VPC, you can use instance.group-name instead.
+      instance.group-name
+          - The name of the security group for the instance. If the instance is in a
+            nondefault VPC, you must use instance.group-id instead.
+      ip-address - The public IP address of the instance.
+      kernel-id - The kernel ID.
+      key-name - The name of the key pair used when the instance was launched.
+      launch-index
+          - When launching multiple instances, this is the index for the instance in
+            the launch group (for example, 0, 1, 2, and so on).
+      launch-time - The time when the instance was launched.
+      monitoring-state - whether instance monitoring is enabled (disabled | enabled).
+      owner-id - The AWS account ID of the instance owner.
+      placement-group-name - The name of the placement group for the instance.
+      platform
+          - The platform. Use windows if you have Windows instances otherwise leave blank.
+      private-dns-name - The private DNS name of the instance.
+      private-ip-address - The private IP address of the instance.
+      product-code - The product code associated with the AMI used to launch the instance.
+      product-code.type - The type of product code (devpay | marketplace).
+      ramdisk-id - The RAM disk ID.
+      reason
+          - The reason for the current state of the instance (for example,
+            shows \"User Initiated [date]\" when you stop or terminate the instance).
+            Similar to the state-reason-code filter.
+      requester-id
+          - The ID of the entity that launched the instance on your behalf (for example,
+            AWS Management Console, Auto Scaling, and so on).
+      reservation-id - The ID of the instance's reservation.
+      root-device-name - Name of instance root device (for example, /dev/sda1).
+      root-device-type - Type of instance root device (ebs | instance-store).
+      source-dest-check
+        - Indicates whether the instance performs source/destination checking. A value
+          of true means that checking is enabled, and false means checking is disabled.
+          The value must be false for the instance to perform network address translation
+          (NAT) in your VPC.
+      spot-instance-request-id - The ID of the Spot Instance request.
+      state-reason-code - The reason code for the state change.
+      state-reason-message - A message that describes the state change.
+      subnet-id - The ID of the subnet for the instance.
+      tag:key=value
+          - The key/value combination of a tag assigned to the resource,
+            where tag:key is the tag's key.
+      tag-key
+          - The key of a tag assigned to the resource. This filter is independent of the
+            tag-value filter. For example, if you use both the filter \"tag-key=Purpose\"
+            and the filter \"tag-value=X\", you get any resources assigned both the tag
+            key Purpose (regardless of what the tag's value is), and the tag value X
+            (regardless of what the tag's key is). If you want to list only resources
+            where Purpose is X, see the tag:key=value filter.
+      tag-value
+          - The value of a tag assigned to the resource. This filter is independent
+            of the tag-key filter.
+      tenancy - The tenancy of an instance (dedicated | default).
+      virtualization-type - The virtualization type of the instance (paravirtual | hvm).
+      vpc-id - The ID of the VPC that the instance is running in.
+      network-interface.description - The description of the network interface.
+      network-interface.subnet-id - The ID of the subnet for the network interface.
+      network-interface.vpc-id - The ID of the VPC for the network interface.
+      network-interface.network-interface.id - The ID of the network interface.
+      network-interface.owner-id - The ID of the owner of the network interface.
+      network-interface.availability-zone - Availability Zone for the network interface.
+      network-interface.requester-id - The requester ID for the network interface.
+      network-interface.requester-managed - Whether the network interface is managed by AWS.
+      network-interface.status - The status of the network interface (available) | in-use).
+      network-interface.mac-address - The MAC address of the network interface.
+      network-interface-private-dns-name - The private DNS name of the network interface.
+      network-interface.source-destination-check
+          - Whether the network interface performs source/destination checking.
+            A value of true means checking is enabled, and false means checking is
+            disabled. The value must be false for the network interface to perform
+            network address translation (NAT) in your VPC.
+      network-interface.group-id - Security group ID associated with the network interface.
+      network-interface.group-name - Security group name associated with the network interface.
+      network-interface.attachment.attachment-id - The ID of the interface attachment.
+      network-interface.attachment.instance-id
+          - Instance ID to which the network interface is attached.
+      network-interface.attachment.instance-owner-id
+          - The owner ID of the instance to which the network interface is attached.
+      network-interface.addresses.private-ip-address
+          - The private IP address associated with the network interface.
+      network-interface.attachment.device-index
+          - The device index to which the network interface is attached.
+      network-interface.attachment.status
+          - The status of the attachment (attaching | attached | detaching | detached).
+      network-interface.attachment.attach-time
+          - The time that the network interface was attached to an instance.
+      network-interface.attachment.delete-on-termination
+          - Specifies whether the attachment is deleted when an instance is terminated.
+      network-interface.addresses.primary
+          - Specifies whether the IP address of the network interface is the
+            primary private IP address.
+      network-interface.addresses.association.public-ip
+          - The ID of the association of an Elastic IP address with a network interface.
+      network-interface.addresses.association.ip-owner-id
+          - The owner ID of the private IP address associated with the network interface.
+      association.public-ip - Elastic IP address bound to the network interface.
+      association.ip-owner-id
+          - The owner of the Elastic IP address associated with the network interface.
+      association.allocation-id
+          - The allocation ID returned when you allocated the Elastic IP address
+            for your network interface.
+      association.association-id
+          - The association ID returned when the network interface was associated
+            with an IP address. "
+  []
+  (println "*FINISH* describe-instances"))
 
 (defn describeInstancesResult->instances
   "Convert DescribeInsancesResult objects to a sequence of instances.
@@ -581,7 +929,7 @@
                 options where more than one line per instance is printed. Default 2.
    :data A DescribeInstancesResult object or collection of those objects to
          be reported upon.  If neither this nor :instances is specified,
-         (describe-instances) is called to retrieve data.
+         (old-describe-instances) is called to retrieve data.
    :instances An Instance collection of instances.  If neither this nor :data
               is speciied, (describe-instances is called to retrieve data.
               If both are specified, the resulting instances from each field are used
@@ -610,7 +958,7 @@
   {:pre [(set? include) (set? exclude) (set? fields)]}
   (let [instances1 (and data (describeInstancesResult->instances data))
         instances2 (and instances (seqify instances))
-        instances2a (and ids (describe-instances :ids ids))
+        instances2a (and ids (old-describe-instances :ids ids))
         instances3 (concat instances1 instances2 instances2a)
         instances4 (if (empty? instances3)
                        (describeInstancesResult->instances
@@ -654,59 +1002,6 @@
       (xpr :Tags (squish-tags (.getTags instance)) pq)
       (xpr :VolumeIds (instance-volume-ids instance) pu)
       (println))))
-
-(defn- tag-regex-find-fn 
-  "Return a function of one argument that takes calls .getTags on the argument
-   the result of re-find if (re-find regex <x>) is true for either the tag key
-   or the tag value for any tag returned.  re-find is called on the key first, then the
-   value, it is not called on the value if the key test returns a logically
-   true value."
-  [regex]
-  {:pre [(instance? java.util.regex.Pattern regex)]}
-  (fn [taggable]
-    (some (fn [tag]
-            (or (re-find regex (.getKey tag))
-                (re-find regex (.getValue tag))))
-          (seq (.getTags taggable)))))
-
-;; *TODO*: note that Filter _values_ can have '*' (zero or more chars) and '?' (one or more chars), as per
-;; http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/Using_Filtering.html#Filtering_Resources_CLI
-;; Filter value matching is case sensitive (hence pretty limited, particularly since there's no disjunction).
-;; Note: wildcard and baskslash chars must be escaped with backslashes.
-;; *TBD*: Whether to change tag-regex behavior to re-match instead of re-find
-;; *TBD*: need filters of some kind (pre or post) that match any interesting field,
-;; not just tags. (userdata, description, instance name, sg names, etc)
-(defn describe-instances
-  "Retrieve zero or more Instances with various filters and regions applied.
-   Returns a collection that can be fed as :data to 'report-instances', e.g.
-   (report-instances :instances (describe-instances :tag-regex #\"(?i)created\"))
-   Options:
-   :region a region keyword from 'region-map', or :all to operate on all regions.
-   :ids a string instance ID, or collection/sequence of same, specifying specific instances
-        whose data should be retrieved.
-   :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
-              values as a filter.  Instances lacking the regex will not be returned.
-              Instances are only returned if the regex passes a 'find', not a
-              'matches' operation. '(?i)' may be useful in your regex to ignore case.
-              Note that tag regexes must filter tags after retrieval from amazon."
-  [& {:keys [region tag-regex ids]}]
-  (let [regions (regions-for-key region)
-        fetch-fn (if ids
-                   (if (> (count ids) 0)
-                     (fn [region] (.describeInstances (ec2 region)
-                                                      (doto (DescribeInstancesRequest.)
-                                                        (.setInstanceIds (seqify ids)))))
-                     (constantly nil))
-                   (fn [region] (.describeInstances (ec2 region))))
-        tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
-    (->> (filter identity (map fetch-fn regions)) ;filter nils
-         flatten
-         (map (fn [descInsRes] (seq (.getReservations descInsRes))))
-         flatten
-         (map (fn [reservation] (seq (.getInstances reservation))))
-         flatten
-         (filter tag-regex-fn)
-         )))
 
 ;; *TODO*: move to jdt.core
 (defn exception-retry
@@ -906,6 +1201,19 @@
                     (squish-tags (.getTags sg))
                     (.getDescription sg))))))
 
+(defn get-security-group
+  "Retrieve SecurityGroup given ID or nil if the SecurityGroup doesn't exist.
+   ID may be string or keyword."
+  [security-group-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  ;; DescribeSecurityGroupsRequest introduced in SDK 1.8.7
+  (try
+    (first (.getSecurityGroups
+            (.describeSecurityGroups (ec2) (doto (DescribeSecurityGroupsRequest.)
+                                      (.setGroupIds [(name security-group-id)])))))
+    (catch AmazonServiceException e nil)))
+
+
 
 ;;;
 ;;; EC2 VPC
@@ -917,6 +1225,17 @@
            "ranges" (seq (.getIpRanges ip-permission))
            "to port" (.getToPort ip-permission)
            "id grps" (seq (.getUserIdGroupPairs ip-permission))))
+
+(defn get-vpc
+  "Retrieve VPC given ID or nil if the VPC doesn't exist.
+   ID may be string or keyword."
+  [vpc-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getVpcs
+            (.describeVpcs (ec2) (doto (DescribeVpcsRequest.)
+                                        (.setVpcIds [(name vpc-id)])))))
+    (catch AmazonServiceException e nil)))
 
 (defn describe-vpcs
  "Return a list of Vpc objects.
@@ -1258,6 +1577,17 @@
                :else (str thing)))
        seq))
 
+(defn get-image
+  "Retrieve Image given ID or nil if the Image doesn't exist.
+   ID may be string or keyword."
+  [image-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getImages
+            (.describeImages (ec2) (doto (DescribeImagesRequest.)
+                                        (.setImageIds [(name image-id)])))))
+    (catch AmazonServiceException e nil)))
+
 (defn describe-images
   "Return a list of Image objects.  Beware calling this without IDs or other filters.
    Options:
@@ -1310,7 +1640,7 @@
     (seq (.getImages (.describeImages (ec2) request)))))
 
 (defn report-images
-  "Report on zero or more Image instances,
+  "Report on zero or more images (AMIs),
    fetch them if none are specified as with 'describe-images'.
 
    CAUTION: without filters, this call returns a lot of data and can take a long time.
@@ -1433,10 +1763,12 @@
   "To delete an image, you need to deregister the image and delete the snapshot
    behind it. The snapshot is found in the BlockDeviceMappings for the image.
    This function provides that capability.
+   Image-id may be a keyword or string.
    *TODO*: Doesn't presently support instance-stores, needs a deleteBundle for those."
   [image-id]
   {:pre [image-id]}
-  (let [images (describe-images :ids image-id)]
+  (let [image-id (name image-id)
+        images (describe-images :ids image-id)]
     (if (empty? images)
       (throw (Exception. (str "Image " image-id " does not appear to exist"))))
     (let [image (first images)
@@ -1470,6 +1802,74 @@
       (= (count result) 1))
     (catch Exception e false)))
 
+
+;;;
+;;; Snapshots
+;;;
+
+(defn get-snapshot
+  "Retrieve Snapshot given ID or nil if the snapshot doesn't exist.
+   ID may be string or keyword."
+  [snapshot-id]
+  ;; .describeSnapshots may throw AmazonServiceException 400 if the snapshot
+  ;; doesn't exist.
+  (try
+    (first (.getSnapshots
+            (.describeSnapshots (ec2) (doto (DescribeSnapshotsRequest.)
+                                        (.setSnapshotIds [(name snapshot-id)])))))
+    (catch AmazonServiceException e nil)))
+
+
+;;;
+;;; Volumes
+;;;
+
+(defmulti  volume-id
+  "Retrieve the volume id of a volume.
+   If the argument is already an ID, return the identity."
+  class)
+(defmethod volume-id String [volume-id] volume-id)
+(defmethod volume-id clojure.lang.Keyword [volume-id] (name volume-id))
+(defmethod volume-id Volume [volume] (.getVolumeId volume))
+
+
+(defn get-volume
+  "Retrieve Volume given ID or nil if the Volume doesn't exist.
+   ID may be string or keyword."
+  [volume-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getVolumes
+            (.describeVolumes (ec2) (doto (DescribeVolumesRequest.)
+                                      (.setVolumeIds [(name volume-id)])))))
+    (catch AmazonServiceException e nil)))
+
+(defn volume-snapshot-ids
+  "Retrieve snapshot ids for a given volume or volume id.
+   The returned snapshots are basically backups of the volume, as opposed to the
+   'source snapshot' of a volume which is the image from which a volume was initially created."
+  [volume-or-id]
+  (let [volume-id (volume-id volume-or-id)]
+    (map #(.getSnapshotId %)
+         (.getSnapshots
+          (.describeSnapshots (ec2)
+                              (doto (DescribeSnapshotsRequest.)
+                                (.setFilters [(Filter. "volume-id" [volume-id])])))))))
+
+;;;
+;;; Subnets
+;;;
+
+(defn get-subnet
+  "Retrieve Subnet given ID or nil if the Subnet doesn't exist.
+   ID may be string or keyword."
+  [subnet-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getSubnets
+            (.describeSubnets (ec2) (doto (DescribeSubnetsRequest.)
+                                      (.setSubnetIds [(name subnet-id)])))))
+    (catch AmazonServiceException e nil)))
 
 
 ;;;
@@ -1727,7 +2127,142 @@
       (println (.getAlarmName ma)
                (.getMetricName ma)
                (.getAlarmDescription ma)))))
-      
+      
+;;;
+;;; Kitchen sink reports/tools
+;;;
 
-  
-  
+(defn print-instance-dependencies
+  "Print the transitive closure of AWS environmental
+   entities on which an instance or instance-id depends.
+   This includes security groups, subnets,
+   volumes, snapshots, AMIs, and so on.
+   Also print a list of things that depend on the instance (auto-scaling groups, etc)."
+  [instance-or-id]
+  (let [instance (if (instance-id? instance-or-id)
+                   (get-instance instance-or-id)
+                   instance-or-id)
+        volume-ids (atom ())
+        print-tags (fn [indent tag-label tagDescriptions]
+                     (if (empty? tagDescriptions)
+                       (cl-format true "~V@T~a: <none>~%" indent tag-label)
+                       (do
+                         (cl-format true "~V@T~a:~%" indent tag-label)
+                         (doseq [tag (sort-aws-tags tagDescriptions ["Name" "Project" "Creator"])]
+                           (cl-format true "~V@T~s ~s~%" (+ 2 indent)
+                             (.getKey tag) (.getValue tag))))))
+        print-security-group-identifiers
+        (fn [indent groupIdentifiers]
+          (when groupIdentifiers
+            (cl-format true "~V@TSecurity Groups:~%" indent)
+            (doseq [group-id groupIdentifiers]
+              (let [sg-id (.getGroupId group-id)
+                    sg (get-security-group sg-id)]
+                (cl-format true "~V@TId: ~a  Name: ~a  Vpc: ~a~%" (+ indent 2)
+                  sg-id (.getGroupName group-id) (.getVpcId sg))
+                (print-tags (+ indent 4) "Security Group Tags" (.getTags sg))))))
+        ]
+
+    (if-not instance
+      (println "Instance" instance-or-id "does not exist.")
+      (do
+        (assert (instance? Instance instance))
+        (cl-format true "~0@TInstance:~20T~a~%" (instance-id instance))
+        (print-tags 2 "Instance Tags" (.getTags instance))
+        (let [image-id (.getImageId instance)
+              image (get-image image-id)]
+          (cl-format true "~2@TAMI:~20T~a~%" image-id)
+          (print-tags 4 "AMI Tags" (.getTags image))
+          (when-let [bdms (.getBlockDeviceMappings image)] ; BlockDeviceMapping, not InstanceBlockDeviceMapping
+            (when-let [ebs-bdms (filter #(.getEbs %) bdms)]
+              (unless (empty? ebs-bdms)
+                (cl-format true "~4@TEBS Block Devices:~%")
+                (doseq [dev ebs-bdms]
+                  (let [ebs-dev (.getEbs dev)
+                        snapshot-id  (.getSnapshotId ebs-dev)
+                        snapshot (get-snapshot snapshot-id)]
+                    (cl-format true "~6@TDevice: ~a  Snapshot: ~a~a  Volume: ~a~%"
+                      (.getDeviceName dev) snapshot-id
+                      (if snapshot "" " (defunct)")
+                      (if snapshot
+                        (.getVolumeId snapshot)
+                        "<unknown>"))
+                    (when snapshot
+                      (print-tags 6 "Snapshot Tags" (.getTags snapshot)))))))))
+        (cl-format true "~2@TKernel:~20T~a~%" (.getKernelId instance))
+        (when-let [vpc-id (.getVpcId instance)]
+          (cl-format true "~2@TVPC:~20T~a~%" vpc-id)
+          (let [vpc (get-vpc vpc-id)]
+            (print-tags 4 "VPC Tags" (.getTags vpc))))
+        (when-let [subnet-id (.getSubnetId instance)]
+          (cl-format true "~2@TSubnet:~20T~a~%" subnet-id)
+          (let [subnet (get-subnet subnet-id)]
+            (print-tags 4 "Subnet Tags" (.getTags subnet))))
+        (if-let [instance-profile (.getIamInstanceProfile instance)]
+          (cl-format true "~2@TInstance Profile:~20T~a ~a~%"
+            (.getId instance-profile) (.getArn instance-profile)))
+        (if-let [key-name (.getKeyName instance)]
+          (cl-format true "~2@TKey Pair:~20T~a~%" key-name))
+        (print-security-group-identifiers 2 (.getSecurityGroups instance))
+        (when-let [network-interfaces (.getNetworkInterfaces instance)]
+          (unless (empty? network-interfaces)
+            (cl-format true "~2@TNetwork Interfaces:~%")
+            (doseq [ni network-interfaces]
+              (cl-format true "~4@TId: ~a~%" (.getNetworkInterfaceId ni))
+              (when-let [association (.getAssociation ni)] ;InstanceNetworkInterfaceAssociation
+                (cl-format true "~6@TEIP: ~20T~a~%" (.getPublicIp association))
+                (cl-format true "~8@TIP Owner Id: ~a~%" (.getIpOwnerId association))
+                (cl-format true "~8@TPublic DNS: ~a~%" (.getPublicDnsName association)))
+              (when-let [attachment (.getAttachment ni)] ; InstanceNetworkInterfaceAttachment
+                (cl-format true "~6@TAttachment: ~a at index ~%"
+                  (.getAttachmentId attachment) (.getDeviceIndex attachment)))
+              (print-security-group-identifiers 6 (.getGroups ni)))))
+        (when-let [ibdms (.getBlockDeviceMappings instance)] ; InstanceBlockDeviceMapping
+          (when-let [ebs-ibdms (filter #(.getEbs %) ibdms)]
+            (unless (empty? ebs-ibdms)
+              (cl-format true "~2@TEBS Block Devices:~%")
+              (doseq [dev ebs-ibdms]
+                (let [ebs-dev (.getEbs dev)]
+                  (let [volume-id  (.getVolumeId ebs-dev)
+                        volume (get-volume volume-id)
+                        volume-tags (.getTags volume)
+                        source-snapshot-id (.getSnapshotId volume)] ; from which volume was created
+                    (swap! volume-ids conj volume-id)
+                    (cl-format true "~4@TDevice: ~a  Volume: ~a~%"
+                      (.getDeviceName dev) volume-id)
+                    (print-tags 6 "Volume Tags" volume-tags)
+                    (when source-snapshot-id
+                      (let [snapshot (get-snapshot source-snapshot-id)]
+                        (cl-format true "~6@TSource Snapshot: ~a~a~%"
+                          source-snapshot-id
+                          (if snapshot "" " (defunct)"))
+                        (if snapshot
+                          (print-tags 8 "Source Snapshot Tags"
+                                      (.getTags snapshot)))))
+                    ))))))
+        ;; Done with the instance itself.  Print supplementary
+        ;; data about things referencing the instance its dependencies.
+        (unless (empty? @volume-ids)
+          (println)
+          (println "Snapshots taken of the above EBS volumes:")
+          (doseq [volume-id @volume-ids]
+            (let [snapshot-ids (volume-snapshot-ids volume-id)]
+              (unless (empty? snapshot-ids)
+                (cl-format true "~2@TVolume ~a~%" volume-id)
+                (doseq [snapshot-id snapshot-ids]
+                  ;; TODO Faster if we fetch all snapshots with one describe-snapshots call.
+                  ;; But describe-snapshots wasn't implemented when I wrote this
+                  (when-let [snapshot (get-snapshot snapshot-id)]
+                    (cl-format true "~4@TSnapshot ~a~%" snapshot-id)
+                    (print-tags 6 "Snapshot Tags" (.getTags snapshot))))))))))
+    ))
+
+;; *TODO* in print-instance-dependencies:
+;; ELBs that point to instance.
+;; auto-scaling, route53, and other references to instance
+;; Can tag auto scaling groups, but not launch configurations.
+
+;; Note on ec2-describe-* --filter "tag:Name=*xyzzy*"
+;; The API is case sensitive for values, however the CONSOLE
+;; is not.  They must build a key set for searching and use a different search
+;; method when you filter via the console.

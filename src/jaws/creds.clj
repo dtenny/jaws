@@ -83,8 +83,8 @@
 ;;; Cred-map definition and updaters
 ;;;
 
-(def cred-map
-  "Map keyed by credential handle, valued by CredentialInfo"
+(defonce cred-map
+  ;;"Map keyed by credential handle, valued by CredentialInfo"
   (atom {}))
 
 (defn def-cred
@@ -132,7 +132,7 @@
    placed into cred-map for subsequent use with use-cred similar cred-binding
    functions.  If function 'handle-fn' is specified, it will be used to derive
    handles for the files (should be a function of one argument, a File).  If
-   no function is specified, the file handles (keys in cred-map) will default
+   no function is specified, the file handles (keys inc red-map) will default
    to the file objects.   Returns nil.
 
    This function has side effects, it adds credentials to an in-memory map."
