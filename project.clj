@@ -1,4 +1,4 @@
-(defproject jaws "0.2.0-SNAPSHOT"
+(defproject jaws "0.2.0"
   :description "Simple tools/wrapper for Amazon AWS JDK API use.
                 Unlikely to be of use to anybody but the author."
   :url "https://github.com/dtenny/jaws"
