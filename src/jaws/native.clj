@@ -21,10 +21,10 @@
             DescribeKeyPairsRequest DescribeSecurityGroupsRequest
             DescribeSnapshotsRequest DescribeSubnetsRequest DescribeTagsRequest
             DescribeVolumesRequest DescribeVpcsRequest
-            Filter Instance InstanceAttributeName Image
+            Filter IamInstanceProfileSpecification Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
-            ModifyImageAttributeRequest ModifyInstanceAttributeRequest RunInstancesRequest
-            Snapshot
+            ModifyImageAttributeRequest ModifyInstanceAttributeRequest
+            Placement RunInstancesRequest Snapshot
             StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest
             Volume])
   (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
@@ -241,6 +241,19 @@
   [id]
   (re-matches #"vol-\p{XDigit}{8}" (name id)))
 
+(defn arn?
+  "If string, symbol, or keyword s resembles an ARN,
+   return a string with the ARN, otherwiser return nil.
+   This is not a rigorous test, i.e. this is not an ARN validator."
+  [s]
+  ;; http://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
+  ;; Formats:
+  ;; arn:aws:service:region:account:resource
+  ;; arn:aws:service:region:account:resourcetype/resource
+  ;; arn:aws:service:region:account:resourcetype:resource
+  (if (.startsWith (name s) "arn:aws:")
+    s))
+
 
 ;;;
 ;;; EC2 - General
@@ -438,6 +451,24 @@
     (.deleteTags (ec2) (doto (DeleteTagsRequest. entities)
                          (.setTags tags)))))
                          
+(defn describe-availability-zones
+  "Return a list of AvailbilityZones objects for the current or specified region."
+  [& {:keys [region] :or {region *region*}}]
+  (into () (.getAvailabilityZones (.describeAvailabilityZones (ec2 region)))))
+
+(defn report-availability-zones
+  "Report on the specified AvailabilityZone objects,
+   or all availability zones in the current region if none were specified.
+   Return nil.
+   See also 'describe-avilability-zones'."
+  [& [availability-zones]]
+  (doseq [az (or availability-zones (describe-availability-zones))]
+    (cl-format true "~a ~15a ~10a~%"
+      (.getZoneName az) (.getRegionName az) (.getState az))
+    (if-let [messages (not-empty (.getMessages az))]
+      (doseq [message messages]
+        (cl-format true "~4T~a~%" (.getMessage message))))))
+
 
 ;;;
 ;;; EC2 - Filter construction
@@ -1191,40 +1222,69 @@
    Returns a sequence of instance ids created.
    
    Arguments:
-   ami-id  The image id to use.
-   :keyname the name of the key pair to use.
-   :type the instance type to use ({m1,m3,c1}.{small,medium,[x]large}, etc)
-         *TODO* online help to list options for this please.
+   ami-id  The image id to use (keyword or string).
+
+   API options:
+   :disable-api-termination if true the instance can't be terminated until
+       this attribute is modified on the instance.
+   :ebs-optimized if true, provide dedicated/optimized EBS throughput (additional cost).
+       Not compatible with all instance types.
    :group-ids security group id or collection of ids to use for secrity groups
    :group-names security group name or collection of names to use for secrity groups
-                (ec2-classic, default-vpc only, can use with group-ids as well)
-   :min    minimum number of instances to run
+       (ec2-classic, default-vpc only, can use with group-ids as well)
+   :instance-profile Name or ARN (symbol,string,keyword) of the instance profile.
+   :keyname the name of the key pair to use.
    :max    maximum number of instances to run
-   :private-ip-address A specific IP address in dotted IPV4 notation to be assigned to the instance
-           (vpc instances only).
+   :min    minimum number of instances to run
+   :monitoring true if details (1 minute, extra cost) monitoring is requested.
+   :placement specifies availability zone to run in, e.g. 'us-east-1b' (string or keyword).
+        See describe-availability-zones for a list of availability zones.
+   :private-ip-address
+       A specific IP address in dotted IPV4 notation to be assigned to the instance
+       (vpc instances only).
+   :shutdown-behavior, string, symbol, or keyword whose name is 'stop' or  'terminate'.
+       Default: stop
    :subnet A specific subnet ID for instances started in a VPC.
+   :type the instance type to use ({m1,m3,c1}.{small,medium,[x]large}, etc)
+       *TODO* online help to list options for this please.
+
+   Jaws options:
+   :region a region keyword from 'region-map' to override *region*.
    :retry-if If specified is a string corresponding to an one of error codes as documented
-             in http://docs.aws.amazon.com/AWSEC2/latest/APIReference/api-error-codes.html.
-             If an AmazonServiceException is thrown with code 400 and
-             AWS Error Code matching the parameter, we will retry the run-instances value.
-             Known useful codes: 'InvalidIPAddress.InUse' if you're retrying a specific
-             ip address assignment to a recently disassociated EIP or private IP address in a VPC.
+       in http://docs.aws.amazon.com/AWSEC2/latest/APIReference/api-error-codes.html.
+       If an AmazonServiceException is thrown with code 400 and
+       AWS Error Code matching the parameter, we will retry the run-instances value.
+       Known useful codes: 'InvalidIPAddress.InUse' if you're retrying a specific
+       ip address assignment to a recently disassociated EIP or
+       private IP address in a VPC.
    :wait   true if this function should not exit until all instances have started.
-           Note that they instances may not yet be responsive just because they're 'running'
-           and have a DNS address.  YMMV.
-   :region a region keyword from 'region-map' to override *region*."
-  [ami-id & {:keys [keyname type group-ids group-names min max private-ip-address subnet
+       Note that they instances may not yet be responsive just because they're 'running'
+       and have a DNS address.  YMMV."
+  [ami-id & {:keys [disable-api-termination ebs-optimized instance-profile
+                    keyname type group-ids group-names max min monitoring
+                    placement private-ip-address shutdown-behavior subnet
                     retry-if wait region]
              :or {region *region* type "t1.micro" min 1 max 1}}]
   {:pre [(not (= region :all))]}
   (let [min (int min)
         max (int max)
-        request (RunInstancesRequest. ami-id min max)]
+        request (RunInstancesRequest. (name ami-id) min max)]
     (.setInstanceType request type)
-    (if keyname (.setKeyName request keyname))
-    (if group-ids (.setSecurityGroupIds request (listify group-ids)))
-    (if group-names (.setSecurityGroups request (listify group-names)))
+    (if disable-api-termination (.setDisableApiTermination request true))
+    (if ebs-optimized (.setEbsOptimized request true))
+    (if keyname (.setKeyName request (name keyname)))
+    (if instance-profile (.setIamInstanceProfile
+                          request (let [iips (IamInstanceProfileSpecification.)]
+                                    (if-let [arn (arn? instance-profile)]
+                                      (.setArn iips arn)
+                                      (.setName iips (name instance-profile)))
+                                    iips)))
+    (if group-ids (.setSecurityGroupIds request (map name (listify group-ids))))
+    (if group-names (.setSecurityGroups request (map name (listify group-names))))
+    (if monitoring (.setMonitoring request true))
+    (if placement (.setPlacement request (Placement. (name placement))))
     (if private-ip-address (.setPrivateIpAddress request private-ip-address))
+    (if shutdown-behavior (.setShutdownBehavior request (name shutdown-behavior)))
     (if subnet (.setSubnetId request subnet))
     (let [run-fn (fn [] (->> (.runInstances (ec2 region) request)
                              (.getReservation)))
@@ -1336,11 +1396,8 @@
 
 (defn report-sgs
   "Print a one line summary (unless options specify otherwise)
-   of security groups for one or more DescribeSecurityGroupsResults instances."
-;; *TODO*: options for region(? - and including :all) and and for :ingress :egress
-;; :region may be a standard option for all things that roll an ec2
-;; maybe also some :regex filtering options, though if we just return tuples
-;; caller can do that other ways
+   of security groups for one or more DescribeSecurityGroupsResults instances.
+   *DEPRECATED* use report-security-groups instead."
   ([] (report-sgs [(.describeSecurityGroups (ec2))]))
   ([describeSecurityGroupsResults] (report-sgs describeSecurityGroupsResults {}))
   ([describeSecurityGroupsResults opts]
@@ -1366,6 +1423,54 @@
                                       (.setGroupIds [(name security-group-id)])))))
     (catch AmazonServiceException e nil)))
 
+
+(defn report-security-groups 
+  "Report on a SecurityGroup object or collection/sequence thereof. Return nil."
+  [security-groups]
+  (doseq [sg (listify security-groups)]
+     (cl-format true "~a ~a ~a ~a ~a ~s~%"
+                    (.getGroupId sg)
+                    (.getGroupName sg)
+                    (.getOwnerId sg)
+                    (or (.getVpcId sg) "<novpc>")
+                    (squish-tags (.getTags sg))
+                    (.getDescription sg))))
+
+(defn describe-security-groups
+  "Return a sequence of Security Groups.
+   If no options are specified, returns a list of all security groups.
+
+   Options:
+     :ids - id or collection of security ids to query
+     :names - name or collection of security group names to query
+     :filters - map of attributes to filter on.
+       Keys may be (keyword, string, symbol) as noted below (case sensitive).
+       Values can be multiple types dependent on the key.
+
+       Valid filter keys:        
+         description - The description of the security group.
+         group-id - The ID of the security group.
+         group-name - The name of the security group.
+         ip-permission.cidr - A CIDR range that has been granted permission.
+         ip-permission.from-port - The start of port range for the TCP and UDP protocols, or an ICMP type number.
+         ip-permission.group-id - The ID of a security group that has been granted permission.
+         ip-permission.group-name - The name of a security group that has been granted permission.
+         ip-permission.protocol - The IP protocol for the permission (tcp | udp | icmp or a protocol number).
+         ip-permission.to-port - The end of port range for the TCP and UDP protocols, or an ICMP code.
+         ip-permission.user-id - The ID of an AWS account that has been granted permission.
+         owner-id - The AWS account ID of the owner of the security group.
+         tag-key - The key of a tag assigned to the security group.
+         tag-value - The value of a tag assigned to the security group.
+         vpc-id - The ID of the VPC specified when the security group was created.
+
+   Note that while :ids and :names cannot use wildcards, filters like :group-name
+   can."
+  [& {:keys [ids names filters]}]
+  (let [request (DescribeSecurityGroupsRequest.)]
+    (if ids (.setGroupIds request (map name (listify ids))))
+    (if names (.setGroupNames request (map name (listify names))))
+    (if filters (.setFilters request (map->ec2-filters filters)))
+    (seq (.getSecurityGroups (.describeSecurityGroups (ec2) request)))))
 
 
 ;;;
@@ -1526,6 +1631,11 @@
              (or (= (.getPrivateIpAddress instance) ip-address)
                  (= (.getPublicIpAddress instance) ip-address)))
            (vpc-instances vpc-id)))
+
+(defn vpc-security-groups
+  "Return security groups defined for the specified vpc-id"
+  [vpc-id]
+  (describe-security-groups :filters {:vpc-id vpc-id}))
 
 
 ;;;
