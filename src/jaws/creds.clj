@@ -1,12 +1,18 @@
 (in-ns 'jaws.native)
 
-;;;
 ;;; Some tools for parsing credential files for jaws.native.
 ;;;
-;;; There are  basically two patterns here.
-;;; You can use 'add-cred-file' or 'add-cred-files' to slurp up the contents
-;;; of credentials files you have on disk into a credentials dictionary,
-;;; or you can use 'defcred' to specify credentials without a file.
+;;; Read http://docs.aws.amazon.com/AWSSdkDocsJava/latest/DeveloperGuide/java-dg-roles.html
+;;; for an overview of using role-based credentials.
+;;;
+;;; Ways to supply credentials to this module:
+;;; 1) Use 'add-cred-file' or 'add-cred-files' to slurp up the contents
+;;;    of credentials files you have on disk into a credentials dictionary.
+;;; 2) Use 'def-cred' to specify credentials without a file.
+;;; 3) Use 'def-cred-instance' to add a handle to the credentials map that
+;;;    uses credentials based solely on the InstanceMetadataService (IMDS)
+;;;    via the com.amazonaws.auth.InstanceProfileCredentialsProvider class.
+;;;    (uses the permissions associated with an EC2 instance via an IAM Role and policy.)
 ;;;
 ;;; Credentials are stored in an in-memory location so that we can quickly access them
 ;;; for AWS credential building operations without file I/O.  That means if you change
@@ -16,7 +22,6 @@
 ;;; Credentials are also keyed.  The nature of the key depends on the API you use
 ;;; to define the credentials in this module, but you have opportunity what you'd like
 ;;; the key to be.
-;;;
 
 
 (def- ACCESS_KEY_PATTERN
@@ -64,7 +69,10 @@
       [access-key key-secret])))
 
 ;; Memory-cached information about AWS credentials
-;; supplied by callers through various APIs.
+;; supplied by callers through various APIs, keyed by 'handle' in a map.
+;;
+;; This could go away and not be missed, unless bridging AWSCredentials and
+;; AWSCredentialsProvider interfaces is somehow useful.
 (defrecord CredentialInfo
     [;; File from which credentials were read, or nil if there wasn't one
      source-file
@@ -73,10 +81,16 @@
      ;; map key.  That's only likely to be a problem if you're using same named
      ;; files from multiple directories and don't use the file path as a key.
      handle
-     ;; The access key of the credential
-     access-key
-     ;; The secret of the credential
-     key-secret
+
+     ;; AWS clients (e.g. EC2, S3Client, etc) take either AWSCredentials
+     ;; AWSCredentialsProvider
+     ;;
+     ;; If we have AWSCredentials, the interface supports getAWSAccessKeyId()
+     ;; and getAWSSecretKey()
+     credentials
+     ;; If we have AWSCredentialsProvider, the interface supports getCredentials()
+     ;; which returns AWSCredentials.
+     credentials-provider
      ])
 
 ;;;
@@ -95,10 +109,36 @@
    'access-key' is the AWS access key id.
    'key-secret' is the AWS secret key value.
 
-   Returns the updated CredentialInfo object."
+   Returns the created/updated CredentialInfo object."
   [handle access-key key-secret]
-  (let [cred-info (map->CredentialInfo
-                   {:handle handle :access-key access-key :key-secret key-secret})]
+  (let [cred-info
+        (map->CredentialInfo
+         {:handle handle
+          :credentials (BasicAWSCredentials. access-key key-secret)})]
+    (swap! cred-map assoc handle cred-info)
+    cred-info))
+
+(defn def-cred-instance
+  "Add a handle to the credentials map that uses credentials based
+   on the InstanceMetadataService (IMDS)
+   via the com.amazonaws.auth.InstanceProfileCredentialsProvider class.
+   Use of these credentials grants permissions based on the EC2 instance associated
+   IAM Role and permissions policy.
+
+   'handle' is the key tha will be used to refer to the credential.
+   It can be whatever you like it to be.
+
+   A com.amazonaws.AmazonClientException may arise when this credential is
+   used to construct a client (e.g. an EC2 Client) if the call to this
+   function was made outside of a viable role-bearing EC2 instance
+   context (though it won't arise at the time def-cred-instance is called).
+
+   Returns the created/updated CredentialInfo object."
+  [handle]
+  (let [cred-info
+        (map->CredentialInfo
+         {:handle handle
+          :credentials-provider (InstanceProfileCredentialsProvider.)})]
     (swap! cred-map assoc handle cred-info)
     cred-info))
 
@@ -122,8 +162,8 @@
           handle (or handle file)
           [access-key key-secret] (parse-cred file)
           cred-info (map->CredentialInfo
-                     {:handle handle :source-file file :access-key access-key
-                      :key-secret key-secret})]
+                     {:handle handle :source-file file
+                      :credentials (BasicAWSCredentials. access-key key-secret)})]
       (swap! cred-map assoc handle cred-info)
       handle)))
       
@@ -178,24 +218,30 @@
 
 ;; Need a version of this in advance of IAM definitions below, for the prompt process
 (defn get-user-account-number-for-prompt
-  "Get the AWS account number of an iam user (as a string)"
-  ([accesskey secret]
-     (try
-       (let [iam (AmazonIdentityManagementClient. (BasicAWSCredentials. accesskey secret))]
-         (second (re-find #".*::(\d+):" (.getArn (.getUser (.getUser iam))))))
-       (catch Exception x "<unknown>"))))
+  "Get the AWS account number of an iam user (as a string) given a
+   CredentialInfo,  AWSCredentials, AWSCredentialsProvider instance."
+  [cred]
+  (let [cred (cond (instance? CredentialInfo cred)
+                   (:credentials cred)
+                   :else cred)]
+    (try
+      (let [iam (AmazonIdentityManagementClient. cred)]
+        (second (re-find #".*::(\d+):" (.getArn (.getUser (.getUser iam))))))
+      (catch Exception x "<unknown>"))))
 
 (defn cred-account-number
-  "Given a keyword/handle for credentials, return (as a string) the AWS account number for the credentials, or
+  "Given a keyword/handle for credentials, return (as a string)
+  the AWS account number for the credentials, or
    '<unknown>' if the credentials aren't valid."
   [cred-keyword]
   (let [cred-info (get @cred-map cred-keyword)]
     (if-not cred-info
       (throw (Exception. (str "Credentials keyword " cred-keyword
                               " is not in the credentials map."))))
-    (get-user-account-number-for-prompt (:access-key cred-info) (:key-secret cred-info))))
+    (get-user-account-number-for-prompt cred-info)))
 
-(defn list-credentials "Print list of known credentials and account numbers" []
+(defn list-credentials
+  "Print and return a sequence of known credentials and account numbers" []
   (println "The following credential files are known:")
   (let [cred-seq (seq @cred-map)
         max-key-length (reduce max 0 (map (fn [e] (count (str (key e)))) cred-seq))]
@@ -204,11 +250,11 @@
         (cl-format true "  ~vs  (~12a)  maps to ~a~%"
                    max-key-length
                    (key entry)
-                   (get-user-account-number-for-prompt (:access-key cred-info)
-                                                       (:key-secret cred-info))
+                   (get-user-account-number-for-prompt cred-info)
                    (or (if-let [file (:source-file cred-info)]
                          (str file))
-                       "<no file specified>"))))))
+                       "<no file specified>"))))
+    cred-seq))
 
 (defn known-cred? [cred-key]
   "Retrn true if cred-key is a keyword for which we have credential information,
@@ -221,13 +267,16 @@
   "Prompt user for keyword into cred-map for credential set to use.
   Return the (validated) keyword."
   []
-  (list-credentials)
-  (loop [answer (read-string
-                 (prompt "Which credentials would you like to use? (specify keyword)"))]
-    (if (answer @cred-map)
-      answer
-      (recur (do (println "Invalid credential keyword" answer)
-                 (read-string (prompt "Which credential keyword?")))))))
+  (if (empty? (list-credentials))
+    (do
+      (println "There are no credentials to choose from.")
+      (println "Add some to the pool of credentials with def-cred, add-cred-file, and so on."))
+    (loop [answer (read-string
+                   (prompt "Which credentials would you like to use? (specify keyword)"))]
+      (if (answer @cred-map)
+        answer
+        (recur (do (println "Invalid credential keyword" answer)
+                   (read-string (prompt "Which credential keyword?"))))))))
       
 (defn current-cred-map-entry
   "Return the map entry in cred-map indicating current credentials in use
@@ -256,19 +305,21 @@
   `(call-with-cred ~key (fn [] ~@body)))
 
 (defn choose-creds
-  "Interactive selectiobn and activataion of credentials for future AWS interaction."
+  "Interactive selection of credentials for future AWS interaction."
   []
   (use-cred (prompt-for-credentials))
   (println "Current creds:" (current-cred-map-entry)))
 
 (defn make-aws-creds
-  "Make some flavor of aws credentials such as BasicAWSCredentials from previously selected credentials
-   and return them. Complain if credentials haven't been set with (choose-creds) or similar mechanism."
+  "Make some flavor of aws credentials such as BasicAWSCredentials from
+   previously selected credentials and return them. Complain if credentials
+   haven't been set with (choose-creds) or similar mechanism."
   []
   (if-not @*current-cred-handle*
     (throw (Exception. "Credentials have not been set, use (choose-creds) or (use-cred)")))
   (let [cred-info (val (current-cred-map-entry))]
-    (BasicAWSCredentials. (:access-key cred-info) (:key-secret cred-info))))
+    (or (:credentials cred-info)
+        (:credentials-provider cred-info))))
 
 (defn add-jdt-cred-files
   "Install JDT's ~/*.aws.cred files with handles derived from the file name

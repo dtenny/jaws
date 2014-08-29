@@ -6,7 +6,7 @@
   (:use [clojure.java.io])
   (:use [clojure.pprint :only [cl-format]])
   (:import [com.amazonaws AmazonServiceException])
-  (:import [com.amazonaws.auth BasicAWSCredentials])
+  (:import [com.amazonaws.auth BasicAWSCredentials InstanceProfileCredentialsProvider])
   (:import [com.amazonaws.regions Regions Region])
   (:import [com.amazonaws.services.autoscaling AmazonAutoScalingClient])
   (:import [com.amazonaws.services.cloudwatch AmazonCloudWatchClient])
@@ -1149,6 +1149,7 @@
   (let [instances2 (and instances (seqify instances))
         instances2a (and ids (describe-instances :ids ids))
         instances3 (concat instances2 instances2a)
+        instances4 (or (empty->nil instances3) (describe-instances))
         fields (difference (union fields include) exclude)
         split-after (into #{} (seqify split-after))
         sp (fn [x] (when (split-after x)
@@ -1158,7 +1159,7 @@
               (when (get fields key)
                 (printfn val)
                 (sp key)))]
-    (doseq [instance instances3]
+    (doseq [instance instances4]
       (do-indent indent)
       (pu (.getInstanceId instance))
       ;; Convert to pure iteration on fields and reflection call? 
