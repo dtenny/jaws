@@ -14,6 +14,7 @@
             DescribeAlarmsRequest ListMetricsRequest])
   (:import [com.amazonaws.services.ec2 AmazonEC2Client AmazonEC2])
   (:import [com.amazonaws.services.ec2.model
+            AuthorizeSecurityGroupIngressRequest
             GetConsoleOutputRequest CreateImageRequest CreateTagsRequest
             DeleteSnapshotRequest DeleteTagsRequest DeregisterImageRequest
             DescribeImagesRequest DescribeInstancesRequest DescribeInstancesResult 
@@ -24,7 +25,7 @@
             Filter IamInstanceProfileSpecification Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
             ModifyImageAttributeRequest ModifyInstanceAttributeRequest
-            Placement RunInstancesRequest Snapshot
+            Placement RevokeSecurityGroupIngressRequest RunInstancesRequest Snapshot
             StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest
             Volume])
   (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
@@ -36,6 +37,13 @@
   (:import java.io.File))
 
 (load "creds")
+
+;;; *TODO* *FINISH*
+;;; *FIXME*: all REPORT and DESCRIBE functions should have a (required) positional argument indicating
+;;; entities to report on, which if empty, causes nothing to be done.  The argument should
+;;; allow ID's or things which can be converted to ID's.  
+;;; :ids and :instances and similar keywords should be removed so existing code won't compile.
+;;; Current "interpret empty list to fetch all" behavior is very undesirable.
 
 ;;;
 ;;; Conventions in this module.
@@ -687,6 +695,17 @@
   (instance-public-ip-address (get-instance instance-id)))
 (defmethod instance-public-ip-address Instance [instance]
   (let [ip-address (.getPublicIpAddress instance)]
+    (and (> (count ip-address) 0)
+         ip-address)))
+
+(defmulti  instance-private-ip-address
+  "Retrieve the private IP address for an instance or instance id,
+   return nil if there isn't one."
+  class)
+(defmethod instance-private-ip-address String [instance-id]
+  (instance-private-ip-address (get-instance instance-id)))
+(defmethod instance-private-ip-address Instance [instance]
+  (let [ip-address (.getPrivateIpAddress instance)]
     (and (> (count ip-address) 0)
          ip-address)))
 
@@ -1473,6 +1492,16 @@
     (if filters (.setFilters request (map->ec2-filters filters)))
     (seq (.getSecurityGroups (.describeSecurityGroups (ec2) request)))))
 
+(defn revoke-security-group-ingress "Because I'm too stupid to figure out Amazonica"
+      [sg-id ip-protocol ip-ranges from-port to-port]
+   (.revokeSecurityGroupIngress (ec2)
+     (doto (RevokeSecurityGroupIngressRequest.)
+       (.setGroupId sg-id)
+       (.setIpProtocol ip-protocol)
+       (.setCidrIp ip-ranges)
+       (.setFromPort (int from-port))
+       (.setToPort (int to-port)))))
+
 
 ;;;
 ;;; EC2 VPC
@@ -2083,6 +2112,11 @@
                                         (.setSnapshotIds [(name snapshot-id)])))))
     (catch AmazonServiceException e nil)))
 
+(defn delete-snapshot
+  "Delete a Snapshot given its ID"
+  [snapshot-id]
+  (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id)))
+
 
 ;;;
 ;;; Volumes
@@ -2408,7 +2442,7 @@
                    instance-or-id)
         volume-ids (atom ())
         print-tags (fn [indent tag-label tagDescriptions]
-                     (if (empty? tagDescriptions)
+                     (if (or (nil? tagDescriptions) (empty? tagDescriptions))
                        (cl-format true "~V@T~a: <none>~%" indent tag-label)
                        (do
                          (cl-format true "~V@T~a:~%" indent tag-label)
@@ -2432,27 +2466,31 @@
       (do
         (assert (instance? Instance instance))
         (cl-format true "~0@TInstance:~20T~a~%" (instance-id instance))
+        (println "  Launch time: " (.toString (.getLaunchTime instance)))
         (print-tags 2 "Instance Tags" (.getTags instance))
         (let [image-id (.getImageId instance)
               image (get-image image-id)]
           (cl-format true "~2@TAMI:~20T~a~%" image-id)
-          (print-tags 4 "AMI Tags" (.getTags image))
-          (when-let [bdms (.getBlockDeviceMappings image)] ; BlockDeviceMapping, not InstanceBlockDeviceMapping
-            (when-let [ebs-bdms (filter #(.getEbs %) bdms)]
-              (unless (empty? ebs-bdms)
-                (cl-format true "~4@TEBS Block Devices:~%")
-                (doseq [dev ebs-bdms]
-                  (let [ebs-dev (.getEbs dev)
-                        snapshot-id  (.getSnapshotId ebs-dev)
-                        snapshot (get-snapshot snapshot-id)]
-                    (cl-format true "~6@TDevice: ~a  Snapshot: ~a~a  Volume: ~a~%"
-                      (.getDeviceName dev) snapshot-id
-                      (if snapshot "" " (defunct)")
-                      (if snapshot
-                        (.getVolumeId snapshot)
-                        "<unknown>"))
-                    (when snapshot
-                      (print-tags 6 "Snapshot Tags" (.getTags snapshot)))))))))
+          (if image
+            (do
+              (print-tags 4 "AMI Tags" (.getTags image))
+              (when-let [bdms (.getBlockDeviceMappings image)] ; BlockDeviceMapping, not InstanceBlockDeviceMapping
+                (when-let [ebs-bdms (filter #(.getEbs %) bdms)]
+                  (unless (empty? ebs-bdms)
+                          (cl-format true "~4@TEBS Block Devices:~%")
+                          (doseq [dev ebs-bdms]
+                            (let [ebs-dev (.getEbs dev)
+                                  snapshot-id  (.getSnapshotId ebs-dev)
+                                  snapshot (get-snapshot snapshot-id)]
+                              (cl-format true "~6@TDevice: ~a  Snapshot: ~a~a  Volume: ~a~%"
+                                         (.getDeviceName dev) snapshot-id
+                                         (if snapshot "" " (defunct)")
+                                         (if snapshot
+                                           (.getVolumeId snapshot)
+                                           "<unknown>"))
+                              (when snapshot
+                                (print-tags 6 "Snapshot Tags" (.getTags snapshot)))))))))
+            (println "    Underlying AMI from which instance was booted has been deleted or is inaccessible.")))
         (cl-format true "~2@TKernel:~20T~a~%" (.getKernelId instance))
         (when-let [vpc-id (.getVpcId instance)]
           (cl-format true "~2@TVPC:~20T~a~%" vpc-id)
