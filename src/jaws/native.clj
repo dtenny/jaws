@@ -335,12 +335,31 @@
                                       [(.getKey tag2) (.getValue tag2)]))))]
     (sort comp tag-list)))
 
+(defn tag-list->map
+  "Return a clojure map presenting tag keys and values from a list/seq of Tag objects.
+   Note that if there are duplicate entries for a key later elements in the list will 
+   supersede earlier ones.
+   'tag-list' a list of ec2.model.Tag elements from 
+   (.getTags instance) or similar calls for other entities."
+  [tag-list]
+  (into {} (map (fn [tag] [(.getKey tag) (.getValue tag)]) tag-list)))
+
+(defn get-tag-for-key
+  "Return the tag value of tag with the indicated tag-key from a sequence of Tag objects, or nil
+   if there isn't a tag in the sequence with the specified key.
+   'tag-list' a list of ec2.model.Tag elements from 
+   (.getTags instance) or similar calls for other entities."
+  [tag-key tag-list]
+  (if-let [tag (find-if (fn [tag] (= (.getKey tag) tag-key)) tag-list)]
+    (.getValue tag)))
+
 (defn get-name-tag
   "Return the tag value of a 'Name' tag from a sequence of Tag objects, or nil
-   if there isn't a Name tag in the sequence."
+   if there isn't a Name tag in the sequence.  
+   'tag-list' a list of ec2.model.Tag elements from 
+   (.getTags instance) or similar calls for other entities."
   [tag-list]
-  (if-let [name-tag (find-if (fn [tag] (= (.getKey tag) "Name")) tag-list)]
-    (.getValue name-tag)))
+  (get-tag-for-key "Name" tag-list))
 
 (defn- squish-tags
   "Take a list of tags and compress them into a single vector of strings of the form 'key=val'.
@@ -708,6 +727,16 @@
   (let [ip-address (.getPrivateIpAddress instance)]
     (and (> (count ip-address) 0)
          ip-address)))
+
+(defmulti instance-tag-map 
+  "Retrieve a Clojure map of EC2 instance tags.
+   Note that instance may have multiple bindings for tag keys, but this interface will 
+   cause later entries in the list to supersede earlier entries."
+  class)
+(defmethod instance-tag-map String [instance-id]
+  (instance-tag-map (get-instance instance-id)))
+(defmethod instance-tag-map Instance [instance]
+  (tag-list->map (.getTags instance)))
 
 (defn instance-volume-ids
   "Return a collection of ebs volume IDs attached to an Instance object."
@@ -1443,6 +1472,10 @@
                                       (.setGroupIds [(name security-group-id)])))))
     (catch AmazonServiceException e nil)))
 
+(defn security-group-exists? 
+  "Return true if the specified security group ID exists, false otherwise."
+  [sg-id]
+  (if (get-security-group sg-id) true false))
 
 (defn report-security-groups 
   "Report on a SecurityGroup object or collection/sequence thereof. Return nil."
