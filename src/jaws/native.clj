@@ -338,11 +338,36 @@
 (defn tag-list->map
   "Return a clojure map presenting tag keys and values from a list/seq of Tag objects.
    Note that if there are duplicate entries for a key later elements in the list will 
-   supersede earlier ones.
+   supersede earlier ones.  See 'tag-list->map-safe' for a version of this routine
+   that does not lose distinct values for duplicate tag names.
+
    'tag-list' a list of ec2.model.Tag elements from 
    (.getTags instance) or similar calls for other entities."
   [tag-list]
   (into {} (map (fn [tag] [(.getKey tag) (.getValue tag)]) tag-list)))
+
+(defn tag-list->map-safe
+  "Return a clojure map presenting tag keys and values from a list/seq of Tag objects.
+   Note that if there are duplicate entries for a tag key
+   the map key will have a vector of (possibly non-distinct) values for the tag key
+   instead of just a string key value.
+
+   'tag-list' a list of ec2.model.Tag elements from 
+   (.getTags instance) or similar calls for other entities."
+  [tag-list]
+  (loop [result {} tag-list tag-list]
+    (if (empty? tag-list)
+      result
+      (let [tag (first tag-list)
+            k (.getKey tag)
+            v (.getValue tag)
+            prior-entry (get result k)
+            map-value (if prior-entry
+                        (if (vector? prior-entry)
+                          (conj prior-entry v)
+                          (conj [] prior-entry v))
+                        v)]
+        (recur (assoc result k map-value) (rest tag-list))))))
 
 (defn get-tag-for-key
   "Return the tag value of tag with the indicated tag-key from a sequence of Tag objects, or nil
@@ -496,6 +521,44 @@
       (doseq [message messages]
         (cl-format true "~4T~a~%" (.getMessage message))))))
 
+(defn ec2-instance-types "Return a lazy sequence of known AWS EC2 instance types as strings" []
+  (map #(.toString %) (com.amazonaws.services.ec2.model.InstanceType/values)))
+
+(defmacro with-ec2-retry 
+  "If an AmazonServiceException is thrown with code 400 and the AWS Error Code
+  of the exception matches a value in retryable-ec2-errors, retry the body after optional sleep period.
+
+  'options is a map or vector of keyword-value pairs:
+  'retry-count': Number of times to retry body, a non-negative integer, zero means 'unlimited retries'.
+  'sleep-secs': Number of seconds to sleep between retries, a non-negative integer, zero means 'do not sleep'.
+
+  Returns the value of 'body', or throws the last uncaught or examined exception.
+
+  Examples:
+    (with-aws-retry [] (println \"run some instances\"))
+    (with-aws-retry [:sleep-secs 0] (println \"run some instances\"))
+    (with-aws-retry {:sleep-secs 0} (println \"run some instances\"))"
+  [options & body]
+  (let [{:keys [retry-count sleep-secs] :or {retry-count 2 sleep-secs 2}} (into {} options)]
+    `(let [retry# (atom ~retry-count)
+           sleep# ~sleep-secs
+           run-fn# (fn [] ~@body)
+           handler-fn# (fn [e#] ; return true if we should retry on exception e
+                         (if (and (instance? AmazonServiceException e#)
+                                  (= (.getStatusCode e#) 400)
+                                  (= (some (fn [ec#] (= (.getErrorCode e#) ec#))
+                                           retryable-ec2-client-errors)))
+                           (do 
+                             (swap! retry# dec)
+                             (when (>= @retry# 0)
+                               (println e#)
+                               (println "Retrying operation in" sleep# "seconds.")
+                               (if (> sleep# 0)
+                                 (Thread/sleep (* sleep# 1000)))
+                               true))
+                           (throw e#)))]
+       (exception-retry run-fn# handler-fn#))))
+
 
 ;;;
 ;;; EC2 - Filter construction
@@ -626,6 +689,57 @@
 
 
 ;;;
+;;; EC2 - regions
+;;;
+
+(def ^:private region-location-map 
+  "Geographic descriptions of regions, I haven't been able to find this information in the AWS API.
+  Keys: region name (String), values: region location as reported by EC2/console
+  This information may not be complete, use 'get-region-location' to access it safely."
+  {"eu-central-1" "Frankfurt"
+   "sa-east-1" "Sao Paulo"
+   "ap-northeast-1" "Tokyo"
+   "eu-west-1" "Ireland"
+   "us-east-1" "North Virginia"
+   "us-west-1" "N. California"
+   "us-west-2" "Oregon"
+   "ap-southeast-2" "Sydney"
+   "ap-southeast-1" "Singapore"})
+  
+(defn get-region-location 
+  "Given a lower case region name, e.g. 'us-east-1' return the geographical location of the region,
+  e.g. 'North Virginia', or 'unknown' if the region is newer than the support in this module 
+  knows about."
+  [region-name]
+  (or (get region-location-map region-name)
+      "unknown"))
+
+(defn get-region-name-for-location
+  "Given a case sensitive region locagion e.g. 'North Virginia' 
+  return the region name of the region, e.g. 'us-east-1', or nil if the region location is unknown,
+  possibly owing to outdated libraries."
+  [region-location]
+  (some (fn [kv] 
+          (if (= (val kv) region-location)
+            (key kv)))
+        region-location-map))
+
+(defn describe-regions 
+  "Return a sequence of Region objects.  Presently doesn't support filters and region names (but should)."
+  []
+  (.getRegions (.describeRegions (ec2))))
+
+(defn report-regions
+  "Report on Region objects as returned by describe-regions"
+  [regions]
+  (cl-format true "~16a~17a~a~%" "Region Name" "Location" "Endpoint")
+  (doseq [region regions]
+    (cl-format true "~16a~17a~a~%" 
+               (.getRegionName region) (get-region-location (.getRegionName region))
+               (.getEndpoint region))))
+
+
+;;;
 ;;; EC2 - instance queries
 ;;;
 (defn get-instance
@@ -640,6 +754,126 @@
                                                 (.setInstanceIds [(name instance-id)])))))))
     (catch AmazonServiceException e nil)))
 
+
+;;
+;; All these instance-* attribute methods return Strings unless otherwise specified.
+;;
+
+;; *TODO*: figure out how to automatically generate these based on java package reflection
+;; (but we'd lose doc strings :-( ) or java doc (keep doc strings, yay!).
+;; and also add a Keyword signature for image specifications (in addition to String and Image)
+;; though we could probably automate that by just converting Keyword to String.
+
+(defmulti  instance-architecture "Return the instance architecture (i386, x86_64)." class)
+(defmethod instance-architecture String [instance-id] (instance-architecture (get-instance instance-id)))
+(defmethod instance-architecture Instance [instance] (.getArchitecture instance))
+
+(defmulti  instance-availability-zone "Return the availability zone of an Instance as a string, e.g.\"us-east-1c\"" class)
+(defmethod instance-availability-zone String [instance-id] (instance-availability-zone (get-instance instance-id)))
+(defmethod instance-availability-zone Instance [instance] (.getAvailabilityZone (.getPlacement instance)))
+
+(defmulti  instance-client-token "Retrieve idempotency token you provided when you launched an instance" class)
+(defmethod instance-client-token String [instance-id] (instance-client-token (get-instance instance-id)))
+(defmethod instance-client-token Instance [instance] (.getClientToken instance))
+
+(defmulti  instance-ebs-optimized? "Return true if the instance is ebs-optimized, false otherwise." class)
+(defmethod instance-ebs-optimized? String [instance-id] (instance-ebs-optimized? (get-instance instance-id)))
+(defmethod instance-ebs-optimized? Instance [instance] (.getEbsOptimized instance))
+
+(defmulti  instance-hypervisor "Return the instance hypervisor (ovm, zen)" class)
+(defmethod instance-hypervisor String [instance-id] (instance-hypervisor (get-instance instance-id)))
+(defmethod instance-hypervisor Instance  [instance] (.getHypervisor instance))
+
+(defmulti  instance-image-id "Return the image-id (AMI) used to launch the instance." class)
+(defmethod instance-image-id String [instance-id] (instance-image-id (get-instance instance-id)))
+(defmethod instance-image-id Instance  [instance] (.getImageId instance))
+
+(defmulti  instance-id "Retrieve the instance id of an instance" class)
+(defmethod instance-id String [instance-id] instance-id)
+(defmethod instance-id clojure.lang.Keyword [instance-id] (name instance-id))
+(defmethod instance-id Instance [instance] (.getInstanceId instance))
+
+(defmulti  instance-life-cycle "Return the instance lifecycle (spot) indicating whether this is a spot instance." class)
+(defmethod instance-life-cycle String [instance-id] (instance-life-cycle (get-instance instance-id)))
+(defmethod instance-life-cycle Instance  [instance] (.getInstanceLifeCycle instance))
+
+(defmulti  instance-type "Return the instance type (t1.micro, ...)" class)
+(defmethod instance-type String [instance-id] (instance-type (get-instance instance-id)))
+(defmethod instance-type Instance  [instance] (.getInstanceType instance))
+
+(defmulti  instance-kernel-id "Return the kernel-id associated with this instance." class)
+(defmethod instance-kernel-id String [instance-id] (instance-kernel-id (get-instance instance-id)))
+(defmethod instance-kernel-id Instance  [instance] (.getKernelId instance))
+
+(defmulti  instance-key-name "Return the key-name associated with this instance." class)
+(defmethod instance-key-name String [instance-id] (instance-key-name (get-instance instance-id)))
+(defmethod instance-key-name Instance  [instance] (.getKeyName instance))
+
+(defmulti  instance-launch-time "Return the launch-time for this instance as a Date." class)
+(defmethod instance-launch-time String [instance-id] (instance-launch-time (get-instance instance-id)))
+(defmethod instance-launch-time Instance  [instance] (.getLaunchTime instance))
+
+(defmulti  instance-private-dns-name
+  "Retrieve the private dns name for an instance or instance id,
+  return nil if there isn't one (e.g. not in :running state).
+  E.g. ip-172-31-25-57.ec2.internal"  
+  class)
+(defmethod instance-private-dns-name String [instance-id] (instance-private-dns-name (get-instance instance-id)))
+(defmethod instance-private-dns-name Instance [instance] (.getPrivateDnsName instance))
+
+(defmulti  instance-private-ip-address "Retrieve the instance private IP address or nil." class)
+(defmethod instance-private-ip-address String [instance-id] (instance-private-ip-address (get-instance instance-id)))
+(defmethod instance-private-ip-address Instance [instance] (empty->nil (.getPrivateIpAddress instance)))
+
+(defmulti  instance-public-dns-name "Retrieve the public dns name for an instance or nil if there isn't one." class)
+(defmethod instance-public-dns-name String [instance-id] (instance-public-dns-name (get-instance instance-id)))
+(defmethod instance-public-dns-name Instance [instance] (empty->nil (.getPublicDnsName instance)))
+
+(defmulti  instance-public-ip-address "Retrieve the public IP address for an instance or nil if there istan't one." class)
+(defmethod instance-public-ip-address String [instance-id] (instance-public-ip-address (get-instance instance-id)))
+(defmethod instance-public-ip-address Instance [instance] (empty->nil (.getPublicIpAddress instance)))
+
+(defmulti  instance-ram-disk-id "Return the ram-disk associated with this instance (can be null?)." class)
+(defmethod instance-ram-disk-id String [instance-id] (instance-ram-disk-id (get-instance instance-id)))
+(defmethod instance-ram-disk-id Instance  [instance] (.getRamdiskId instance))
+
+(defmulti  instance-root-device-name "Return the root device name of this instance (e.g. /dev/sda1, /dev/xvda)." class)
+(defmethod instance-root-device-name String [instance-id] (instance-root-device-name (get-instance instance-id)))
+(defmethod instance-root-device-name Instance  [instance] (.getRootDeviceName instance))
+
+(defmulti  instance-root-device-type "Return the root device type of this instance (ebs, instance-store)." class)
+(defmethod instance-root-device-type String [instance-id] (instance-root-device-type (get-instance instance-id)))
+(defmethod instance-root-device-type Instance  [instance] (.getRootDeviceType instance))
+
+(defmulti  instance-security-groups "Return a [realized] sequence of security groups for this instance as [sg-name sg-id] vectors." class)
+(defmethod instance-security-groups String [instance-id] (instance-security-groups (get-instance instance-id)))
+(defmethod instance-security-groups Instance  [instance] (doall (map #(vector (.getGroupName %) (.getGroupId %))
+                                                                     (.getSecurityGroups instance))))
+
+(defmulti  instance-security-group-ids "Return a [realized] sequence of ids of security groups applied to this instance." class)
+(defmethod instance-security-group-ids String [instance-id] (instance-security-group-ids (get-instance instance-id)))
+(defmethod instance-security-group-ids Instance  [instance] (doall (map #(.getGroupId %) (.getSecurityGroups instance))))
+
+(defmulti  instance-security-group-names "Return a [realized] sequence of names of security groups applied to this instance." class)
+(defmethod instance-security-group-names String [instance-id] (instance-security-group-names (get-instance instance-id)))
+(defmethod instance-security-group-names Instance  [instance] (doall (map #(.getGroupName %) (.getSecurityGroups instance))))
+
+(defmulti  instance-source-dest-check? 
+  "Return true if an instance was launched in a VPC to perform NAT.
+  The value must be false if the instance is to perform NAT." 
+  class)
+(defmethod instance-source-dest-check? String [instance-id] (instance-source-dest-check? (get-instance instance-id)))
+(defmethod instance-source-dest-check? Instance  [instance] (.getSourceDestCheck instance))
+
+(defmulti  instance-spot-instance-request-id "Return the id of the spot instance request." class)
+(defmethod instance-spot-instance-request-id String [instance-id] (instance-spot-instance-request-id (get-instance instance-id)))
+(defmethod instance-spot-instance-request-id Instance  [instance] (.getSpotInstanceRequestId instance))
+
+(defmulti  instance-sriov-net-support 
+  "Return a mystery String describing whether an instance supports enhanced networking, nil if none." 
+  class)
+(defmethod instance-sriov-net-support String [instance-id] (instance-sriov-net-support (get-instance instance-id)))
+(defmethod instance-sriov-net-support Instance  [instance] (.getSriovNetSupport instance))
 
 (defmulti  instance-state
     "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
@@ -656,6 +890,66 @@
       (do (comment (println "Oops: getState=" (.getState instance)));commented out for demo mode.
           (str state "-" code))
       state)))
+
+;; instance-state-reason not defined at the moment.
+
+(defmulti  instance-state-transition-reason "Return the reason for the most recent instant state change, or nil if none." class)
+(defmethod instance-state-transition-reason String [instance-id] (instance-state-transition-reason (get-instance instance-id)))
+(defmethod instance-state-transition-reason Instance  [instance] (empty->nil (.getSpotInstanceRequestId instance)))
+
+(defmulti  instance-subnet-id "Return the subnet id of an instance." class)
+(defmethod instance-subnet-id String [instance-id] (instance-subnet-id (get-instance instance-id)))
+(defmethod instance-subnet-id Instance  [instance] (empty->nil (.getSubnetId instance)))
+
+(defmulti instance-tag-map 
+  "Retrieve a Clojure map of EC2 instance tags.
+  Note that instance may have multiple bindings for tag keys, but this interface will 
+  cause later entries in the list to supersede earlier entries.
+  See also: instance-tag-map-all."
+  class)
+(defmethod instance-tag-map String [instance-id] (instance-tag-map (get-instance instance-id)))
+(defmethod instance-tag-map Instance [instance] (tag-list->map (.getTags instance)))
+
+(defmulti  instance-tag-map-all 
+  "Return the tags of an instance as a Map of tag names as strings and tag values as strings.
+  Caveat: if there are multiple tags with the same tag name, the map value for the tag name
+  will be a vector of (possibly duplicate) tag values for the name.
+  See also: instance-tag-map."
+  class)
+(defmethod instance-tag-map-all String [instance-id] (instance-tag-map-all (get-instance instance-id)))
+(defmethod instance-tag-map-all Instance  [instance] (tag-list->map-safe (.getTags instance)))
+
+(defmulti  instance-virtualization-type "Return the instance virtualization-type (hvm, paravirtual)." class)
+(defmethod instance-virtualization-type String [instance-id] (instance-virtualization-type (get-instance instance-id)))
+(defmethod instance-virtualization-type Instance  [instance] (.getVirtualizationType instance))
+
+(defmulti  instance-vpc-id "Return the instance vpc-id." class)
+(defmethod instance-vpc-id String [instance-id] (instance-vpc-id (get-instance instance-id)))
+(defmethod instance-vpc-id Instance  [instance] (.getVpcId instance))
+
+
+
+(defn instance-volume-ids
+  "Return a collection of ebs volume IDs attached to an Instance object."
+  [instance]
+  (->> (.getBlockDeviceMappings instance)
+       (map (fn [mapping] (.getEbs mapping)))
+       (map (fn [dev] (.getVolumeId dev)))))
+
+(defn- tag-regex-find-fn 
+  "Return a function of one argument that takes calls .getTags on the argument
+   the result of re-find if (re-find regex <x>) is true for either the tag key
+   or the tag value for any tag returned.  re-find is called on the key first, then the
+   value, it is not called on the value if the key test returns a logically
+   true value."
+  [regex]
+  {:pre [(instance? java.util.regex.Pattern regex)]}
+  (fn [taggable]
+    (some (fn [tag]
+            (or (re-find regex (.getKey tag))
+                (re-find regex (.getValue tag))))
+          (seq (.getTags taggable)))))
+
 
 (defmulti  wait-for-instance-state
   "Wait for an instance to reach the designated instance state.
@@ -687,82 +981,6 @@
   (if verbose
     (println)))
   
-(defmulti  instance-id
-  "Retrieve the instance id of an instance (or, if the argument is already an ID, return the identity."
-  class)
-(defmethod instance-id String [instance-id] instance-id)
-(defmethod instance-id clojure.lang.Keyword [instance-id] (name instance-id))
-(defmethod instance-id Instance [instance] (.getInstanceId instance))
-
-(defmulti  instance-public-dns-name
-  "Retrieve the public dns name for an instance or instance id,
-   return nil if there isn't one.  Note that this information isn't available at all
-   until the instance is in the :running state, and maybe not even then for VPC instances."
-  class)
-(defmethod instance-public-dns-name String [instance-id]
-  (instance-public-dns-name (get-instance instance-id)))
-(defmethod instance-public-dns-name Instance [instance]
-  (let [dns-name (.getPublicDnsName instance)]
-    (and (> (count dns-name) 0)
-         dns-name)))
-
-(defmulti  instance-public-ip-address
-  "Retrieve the public IP address for an instance or instance id,
-   return nil if there isn't one."
-  class)
-(defmethod instance-public-ip-address String [instance-id]
-  (instance-public-ip-address (get-instance instance-id)))
-(defmethod instance-public-ip-address Instance [instance]
-  (let [ip-address (.getPublicIpAddress instance)]
-    (and (> (count ip-address) 0)
-         ip-address)))
-
-(defmulti  instance-private-ip-address
-  "Retrieve the private IP address for an instance or instance id,
-   return nil if there isn't one."
-  class)
-(defmethod instance-private-ip-address String [instance-id]
-  (instance-private-ip-address (get-instance instance-id)))
-(defmethod instance-private-ip-address Instance [instance]
-  (let [ip-address (.getPrivateIpAddress instance)]
-    (and (> (count ip-address) 0)
-         ip-address)))
-
-(defmulti instance-tag-map 
-  "Retrieve a Clojure map of EC2 instance tags.
-   Note that instance may have multiple bindings for tag keys, but this interface will 
-   cause later entries in the list to supersede earlier entries."
-  class)
-(defmethod instance-tag-map String [instance-id]
-  (instance-tag-map (get-instance instance-id)))
-(defmethod instance-tag-map Instance [instance]
-  (tag-list->map (.getTags instance)))
-
-(defn instance-volume-ids
-  "Return a collection of ebs volume IDs attached to an Instance object."
-  [instance]
-  (->> (.getBlockDeviceMappings instance)
-       (map (fn [mapping] (.getEbs mapping)))
-       (map (fn [dev] (.getVolumeId dev)))))
-
-(defn instance-availability-zone
-  "Return the availability zone of an Instance"
-  [instance]
-  (.getAvailabilityZone (.getPlacement instance)))
-
-(defn- tag-regex-find-fn 
-  "Return a function of one argument that takes calls .getTags on the argument
-   the result of re-find if (re-find regex <x>) is true for either the tag key
-   or the tag value for any tag returned.  re-find is called on the key first, then the
-   value, it is not called on the value if the key test returns a logically
-   true value."
-  [regex]
-  {:pre [(instance? java.util.regex.Pattern regex)]}
-  (fn [taggable]
-    (some (fn [tag]
-            (or (re-find regex (.getKey tag))
-                (re-find regex (.getValue tag))))
-          (seq (.getTags taggable)))))
 
 (def describe-instances-filters
   "A map whose keys are valid filter names for describe-instances
@@ -937,44 +1155,10 @@
        (map (fn [reservation] (seq (.getInstances reservation))))
        flatten))
 
-(defn old-describe-instances
-  "Retrieve zero or more Instances with various filters and regions applied.
-   Returns a collection that can be fed as :data to 'report-instances', e.g.
-   (report-instances :instances (old-describe-instances :tag-regex #\"(?i)created\"))
-   Options:
-   :region a region keyword from 'region-map', or :all to operate on all regions.
-   :ids a string or keyword instance ID, or collection/sequence of same, specifying specific instances
-        whose data should be retrieved.
-   :tag-regex a regular expression (java.util.regex.Pattern) applied to tag names and
-              values as a filter.  Instances lacking the regex will not be returned.
-              Instances are only returned if the regex passes a 'find', not a
-              'matches' operation. '(?i)' may be useful in your regex to ignore case.
-              Note that tag regexes must filter tags after retrieval from amazon."
-  [& {:keys [region tag-regex ids]}]
-  (print "**WARNING** Deprecated: old-describe-instances")
-  (let [regions (regions-for-key region)
-        fetch-fn (if ids
-                   (let [ids (map name (listify ids))]
-                     (if (> (count ids) 0)
-                       (fn [region] (.describeInstances (ec2 region)
-                                                        (doto (DescribeInstancesRequest.)
-                                                          (.setInstanceIds ids))))
-                       (constantly nil)))
-                   (fn [region] (.describeInstances (ec2 region))))
-        tag-regex-fn (if tag-regex (tag-regex-find-fn tag-regex) identity)]
-    (->> (filter identity (map fetch-fn regions)) ;filter nils
-         flatten
-         (map (fn [descInsRes] (seq (.getReservations descInsRes))))
-         flatten
-         (map (fn [reservation] (seq (.getInstances reservation))))
-         flatten
-         (filter tag-regex-fn)
-         )))
-
-;; jdt.core candidate
+;; jdt.core candidate, or maybe a 'jdt.fancy-functions' module for queries that are 
 ;;; See also test-validate-defn-keywords in native_test.clj
 (defn validate-defn-keywords
-  "Given a map of keyword/value pairs specify to a function call to a function
+  "Given a map of keyword/value pairs passed to a function call to a function
    declared with a map, e.g. (defn foo [& {:keys [a b c] :as all-keys}])
 
    Throw IllegalArgumentException if any keywords in
@@ -1171,9 +1355,8 @@
            additional indent-incr spaces.
    :indent-incr amount to additionally indent secondary data lines (for
                 options where more than one line per instance is printed. Default 2.
-   :instances An Instance or collection thereof.  If neither this nor :ids
-              is speciied, (describe-instances is called to retrieve data.
-              If both are specified, the resulting instances from each field are used
+   :instances An Instance or collection thereof.  If both this and :ids are specified
+              the resulting instances from each field are used
               (all together).  Note that you can turn instance IDs to instances
               via 'describe-instances'.
    :ids An instance ID or collection thereof, passed to 'describe-instances'.
@@ -1197,7 +1380,6 @@
   (let [instances2 (and instances (seqify instances))
         instances2a (and ids (describe-instances :ids ids))
         instances3 (concat instances2 instances2a)
-        instances4 (or (empty->nil instances3) (describe-instances))
         fields (difference (union fields include) exclude)
         split-after (into #{} (seqify split-after))
         sp (fn [x] (when (split-after x)
@@ -1207,7 +1389,7 @@
               (when (get fields key)
                 (printfn val)
                 (sp key)))]
-    (doseq [instance instances4]
+    (doseq [instance instances3]
       (do-indent indent)
       (pu (.getInstanceId instance))
       ;; Convert to pure iteration on fields and reflection call? 
@@ -1231,40 +1413,33 @@
              (.getArn ip)
              "<noInstanceProfile>")
            pu)
-      (xpr :SecurityGroups (map #(.getGroupName %) (.getSecurityGroups instance)) pu)
+      (xpr :SecurityGroups (map #(.getGroupName %) (.getSecurityGroups instance)) pq);definitely quote!
       (xpr :Tags (squish-tags (.getTags instance)) pq)
       (xpr :VolumeIds (instance-volume-ids instance) pu)
       (println))))
 
-;; *TODO*: move to jdt.core
-(defn exception-retry
-  "Call function f with exception handler fe.  If an
-   exception is thrown by f, call fe on the exception, and then call f again
-   if the result of calling fe is logically true or unless fe throws.
+(def retryable-ec2-client-errors
+  "400-series client error codes from 
+  http://docs.aws.amazon.com/AWSEC2/latest/APIReference/api-error-codes.html
+  which are known to have use cases in which a brief sleep and retry may solve
+  the problem because of 'eventually consistent' to the cloud state of EC2 entities
+  taking place while we want for things recently changed.
 
-   If f completes execution without throwing we return the return value of f.
-   If f throws and fe returns logical false, return nil.
-
-   f must not return a function, this is prohibited and will result in an exception.
-
-   This function is a non-recursive workaround for situations for where
-   you want to recurse in a catch/finally statement (i.e. retry a try block in the face of
-   exceptions thrown from the try block).  You can't use 'recur' in catch/finally.
-   This works around it.
-
-   E.g. (loop [] (try (f) (catch Exception e (recur)))) ; WILL NOT WORK
-   but  (exception-retry f (fn [] true)) ; WILL WORK
-
-   In practice you want fe to examine the exception raised
-   and probably sleep before returning to try f again.  Maybe print a message
-   that this a retry is happening."
-  [f fe]
-  (let [tryfn
-        (fn [] (try (let [result (f)]
-                      (assert (not (fn? result)))
-                      result)
-                    (catch Exception e (if (fe e) f nil))))]
-    (trampoline tryfn)))
+  See 'with-ec2-retry' for a macro that will repeat code in response to these errors."
+  ["ConcurrentTagAccess"
+   "DependencyViolation"
+   "IncorrectInstanceState"
+   "IncorrectState"
+   "InvalidAMIID.Unavailable"
+   "InvalidAMIName.Duplicate"
+   "InvalidInstanceID"
+   "InvalidInstanceID.NotFound"
+   "InvalidIPAddress.InUse"
+   "InvalidSnapshot.InUse"
+   "InvalidSnapshot.NotFound"
+   "InvalidState"
+   "VolumeInUse"
+])
 
 (defn run-instances
   "Start new instances from a specificed AMI.  *FINISH*: this is a work in progress.
@@ -1335,6 +1510,7 @@
     (if private-ip-address (.setPrivateIpAddress request private-ip-address))
     (if shutdown-behavior (.setShutdownBehavior request (name shutdown-behavior)))
     (if subnet (.setSubnetId request subnet))
+    ;; *TODO*: REPLACE THIS WITH 'with-ec2-retry'
     (let [run-fn (fn [] (->> (.runInstances (ec2 region) request)
                              (.getReservation)))
           handler-fn (fn [e]   ; return true if we should retry on exception e
@@ -1353,7 +1529,8 @@
           user-name (iam-get-user-name)]
       (cl-format true "Instance~p created: ~s~%" (count instances) instance-ids)
       (doseq [id instance-ids]
-        (create-tags id {:created-by user-name})) ; *TBD*: let caller pass additional tags
+        (with-ec2-retry []
+          (create-tags id {:created-by user-name}))) ; *TBD*: let caller pass additional tags
       (if wait
         (doseq [id instance-ids]
           (wait-for-instance-state id :running :verbose true)))
@@ -1382,6 +1559,35 @@
       (doseq [id ids]
         (wait-for-instance-state id :running :verbose true)))))
 
+
+(defn retry-starting-instance 
+  "Try to start a single instance.  Return nil when successful.
+
+  If we get AmazonServiceException Status code 500 Error code InsufficientInstanceCapacity,
+  sleep 45 seconds and try again.
+
+  This situation can arise when the AWS AZ in a region is basically so full that it can't
+  allocate resources for the type instance to be started, particularly for resource-intensive instances.
+  
+  *TODO*: fold 'retry-starting-instance' in 'start-instances' as a :retry option.
+  However we need to test it, which means we need the instance retry failure, and there are some
+  questions;
+  - Does startInstances fail for all if only one could not be started?
+    I believe that startInstances is all-or-nothing.  Of course we could have :retry disclaim
+    all or nothing behavior if supported.
+  - Do we have the correct understanding of the interaction with AmazonServiceException?
+  So for now this retry-starting-instance method is standalone."
+  [instance-id]
+  (let [ran-it (atom nil)]
+    (while (not @ran-it)
+      (try
+        (start-instances instance-id)
+        (reset! ran-it true)
+        ;; *TODO*: refine this to make sure it's the exception we expect
+        ;; Check e.getErrorCode() a string, and e.getErrorType(), an AmazonServiceException.ErrorType
+        ;; enum, we want the Client enum (?). See also other methods on AmazoneServiceException
+        (catch com.amazonaws.AmazonServiceException e (println e) (Thread/sleep 45000))
+      ))))
 
 (defn stop-instances
   "Stop one or more instances, waiting if requested.  Return value unspecified.
@@ -1452,7 +1658,7 @@
   ([describeSecurityGroupsResults opts]
      (doseq [describeSecurityGroupsResult describeSecurityGroupsResults]
        (doseq [sg (.getSecurityGroups describeSecurityGroupsResult)]
-         (cl-format true "~a ~a ~a ~a ~a ~s~%"
+         (cl-format true "~a ~s ~a ~a ~a ~s~%"
                     (.getGroupId sg)
                     (.getGroupName sg)
                     (.getOwnerId sg)
@@ -1630,10 +1836,11 @@
                                                  [(Filter. "vpc-id" [(.getVpcId vpc)])])))]
         (doseq [sg (.getSecurityGroups describeSecurityGroupsResult)]
           (do-indent 2)
-          (println (.getGroupId sg)
-                   (.getGroupName sg)
-                   (.getDescription sg)
-                   (squish-tags (.getTags sg)))
+          (cl-format true "~a ~s ~s ~a~%"
+                     (.getGroupId sg)
+                     (.getGroupName sg)
+                     (.getDescription sg)
+                     (squish-tags (.getTags sg)))
           (when-let [perms (seq (.getIpPermissions sg))]
             (println "    Ingress:")
             (doseq [ipPermission perms]
@@ -1914,6 +2121,97 @@
                                         (.setImageIds [(name image-id)])))))
     (catch AmazonServiceException e nil)))
 
+;;
+;; All these image-* attribute methods return Strings unless otherwise specified.
+;;
+
+;; *TODO*: figure out how to automatically generate these based on java package reflection
+;; (but we'd lose doc strings :-( ) or java doc (keep doc strings, yay!).
+;; and also add a Keyword signature for image specifications (in addition to String and Image)
+;; though we could probably automate that by just converting Keyword to String.
+
+(defmulti  image-architecture "Return the image architecture (i386, x86_64)." class)
+(defmethod image-architecture String [image-id] (image-architecture (get-image image-id)))
+(defmethod image-architecture Image [image] (.getArchitecture image))
+
+(defmulti  image-creation-date "Return the image creation date." class)
+(defmethod image-creation-date String [image-id] (image-creation-date (get-image image-id)))
+(defmethod image-creation-date Image  [image] (.getCreationDate image))
+
+(defmulti  image-description "Return the image description." class)
+(defmethod image-description String [image-id] (image-description (get-image image-id)))
+(defmethod image-description Image  [image] (.getDescription image))
+
+(defmulti  image-hypervisor "Return the image hypervisor (ovm, zen)" class)
+(defmethod image-hypervisor String [image-id] (image-hypervisor (get-image image-id)))
+(defmethod image-hypervisor Image  [image] (.getHypervisor image))
+
+(defmulti  image-id "Return the image id." class)
+(defmethod image-id String [image-id] (image-id (get-image image-id)))
+(defmethod image-id Image [image] (.getImageId image))
+
+(defmulti  image-location "Return the image 'location', whatever that is. E.g. '644593888333/20150506 some image description'" class)
+(defmethod image-location String [image-id] (image-location (get-image image-id)))
+(defmethod image-location Image  [image] (.getImageLocation image))
+
+(defmulti  image-owner-alias "Return the image owner-alias, e.g. amazon, self, account-id, or nil." class)
+(defmethod image-owner-alias String [image-id] (image-owner-alias (get-image image-id)))
+(defmethod image-owner-alias Image  [image] (.getImageOwnerAlias image))
+
+(defmulti  image-type "Return the image type e.g. machine, kernel, ramdisk." class)
+(defmethod image-type String [image-id] (image-type (get-image image-id)))
+(defmethod image-type Image  [image] (.getImageType image))
+
+(defmulti  image-kernel-id "Return the image kernel-id or nil if none." class)
+(defmethod image-kernel-id String [image-id] (image-kernel-id (get-image image-id)))
+(defmethod image-kernel-id Image  [image] (.getKernelId image))
+
+(defmulti  image-name "Return the image name provided during image creation." class)
+(defmethod image-name String [image-id] (image-name (get-image image-id)))
+(defmethod image-name Image  [image] (.getName image))
+
+(defmulti  image-owner-id "Return the image owner AWS account ID." class)
+(defmethod image-owner-id String [image-id] (image-owner-id (get-image image-id)))
+(defmethod image-owner-id Image  [image] (.getOwnerId image))
+
+(defmulti  image-public? "Return true if the image has public launch permissions, false otherwise." class)
+(defmethod image-public? String [image-id] (image-public? (get-image image-id)))
+(defmethod image-public? Image  [image] (.getPublic image))
+
+(defmulti  image-ram-disk-id "Return the image ram disk id or nil if none." class)
+(defmethod image-ram-disk-id String [image-id] (image-ram-disk-id (get-image image-id)))
+(defmethod image-ram-disk-id Image  [image] (.getRamdiskId image))
+
+(defmulti  image-root-device-name "Return the image root-device-name e.g. /dev/sda1, xvda." class)
+(defmethod image-root-device-name String [image-id] (image-root-device-name (get-image image-id)))
+(defmethod image-root-device-name Image  [image] (.getRootDeviceName image))
+
+(defmulti  image-root-device-type "Return the image root-device-type (ebs, instance-store)" class)
+(defmethod image-root-device-type String [image-id] (image-root-device-type (get-image image-id)))
+(defmethod image-root-device-type Image  [image] (.getRootDeviceType image))
+
+(defmulti  image-sriov-net-support 
+  "Return a mystery String describing whether an image supports enhanced networking, nil if none." class)
+(defmethod image-sriov-net-support String [image-id] (image-sriov-net-support (get-image image-id)))
+(defmethod image-sriov-net-support Image  [image] (.getSriovNetSupport image))
+
+(defmulti  image-state "Return the image state (available, deregistered)." class)
+(defmethod image-state String [image-id] (image-state (get-image image-id)))
+(defmethod image-state Image  [image] (.getState image))
+
+(defmulti  image-tag-map 
+  "Return the tags of an image as a Map of tag names as strings and tag values as strings.
+  Caveat: if there are multiple tags with the same tag name, the map value for the tag name
+  will be a vector of (possibly duplicate) tag values for the name."
+  class)
+(defmethod image-tag-map String [image-id] (image-tag-map (get-image image-id)))
+(defmethod image-tag-map Image  [image] (tag-list->map-safe (.getTags image)))
+
+(defmulti  image-virtualization-type "Return the image virtualization-type (hvm, paravirtual)." class)
+(defmethod image-virtualization-type String [image-id] (image-virtualization-type (get-image image-id)))
+(defmethod image-virtualization-type Image  [image] (.getVirtualizationType image))
+
+
 (defn describe-images
   "Return a list of Image objects.  Beware calling this without IDs or other filters.
    Options:
@@ -1965,6 +2263,9 @@
     (if filters (.setFilters request (map->ec2-filters filters)))
     (seq (.getImages (.describeImages (ec2) request)))))
 
+;; *TODO*: report on image attributes in order listed in arguments, means we probably can't use 
+;; sets.  Do this for all report-* functions.
+;; *TODO*: never call describe-images from report-images, require images or image-ids from caller.
 (defn report-images
   "Report on zero or more images (AMIs),
    fetch them if none are specified as with 'describe-images'.
@@ -1976,9 +2277,9 @@
    :images - an Image or collection of Image instances, optional.
 
    :fields - set of fields (information) to display in addition to image id.
-             Defaults to: #{:ImageLocation :Architecture :ImageType :StoreType
-                      :Platform :State :Description :Tags}
-             Additional fields include: :Name, :Owner :Devices
+             Defaults to: #{:Name :ImageType :CreationDate :State :Description :Tags}
+             Additional fields include: :Architecture :Owner :Devices :StoreType :ImageLocation
+                                        :Platform 
    :include Set of additional fields to display, defaults to #{}
    :exclude Set of fields to exclude from the display, defaults to #{}.
 
@@ -1987,8 +2288,7 @@
 
    Returns nil."
   [& {:keys [images ids owned-by exec-by fields include exclude]
-      :or {fields #{:ImageLocation :Architecture :ImageType :StoreType :Platform :State
-                    :Description :Tags}
+      :or {fields #{:Name :ImageType :CreationDate :State :Description :Tags}
            include #{} exclude #{}}}]
   {:pre [(set? include) (set? exclude) (set? fields)]}
    
@@ -2003,6 +2303,7 @@
       (pif (:ImageLocation fields) (.getImageLocation image) pq)
       (pif (:Name fields) (.getName image) pq)
       (pif (:Owner fields) (.getOwnerId image) pu)
+      (pif (:CreationDate fields) (.getCreationDate image) pu)
       (pif (:Architecture fields) (.getArchitecture image) pu)
       (pif (:ImageType fields) (.getImageType image) pu)
       (pif (:Platform fields) 
@@ -2087,10 +2388,14 @@
 ;; is associated with EC2 instances on the account (running or not).
 (defn delete-image
   "To delete an image, you need to deregister the image and delete the snapshot
-   behind it. The snapshot is found in the BlockDeviceMappings for the image.
-   This function provides that capability.
-   Image-id may be a keyword or string.
-   *TODO*: Doesn't presently support instance-stores, needs a deleteBundle for those."
+  behind it. The snapshot is found in the BlockDeviceMappings for the image.
+  This function provides that capability.
+  Image-id may be a keyword or string.
+  
+  NOTE: you may also wish to delete volumes based on the snapshot deleted, but they may still be in 
+  use.  *TBD*: Add option to attempt to delete associated volume.
+
+  *TODO*: Doesn't presently support instance-stores, needs a deleteBundle for those."
   [image-id]
   {:pre [image-id]}
   (let [image-id (name image-id)
@@ -2103,21 +2408,20 @@
         (throw (Exception. (str "Image " image-id " does not appear to have block device mappings."
                                 " I am unsure of how to delete it."))))
       (let [ebsBlockDevices (filter identity (map #(.getEbs %) blockDeviceMappings))]
-        (if (> (count ebsBlockDevices) 1)
-          (throw (Exception. (str "Image " image-id " has more than one EBS block device mapping."
-                                  " I don't deal with that right now, perhaps I should report on them and ignore them.  *TBD*"))))
-        (if (= (count ebsBlockDevices) 0)
-          (throw (Exception. (str "Image " image-id " has no EBS block device mappings"
-                                  " I don't know how to delete such an image."))))
-        (let [snapshot-id (.getSnapshotId (first ebsBlockDevices))]
-          (println)
-          (println "The following image will be deregistered, and the associated EBS snapshot deleted.")
-          (report-images :images images :include #{:Devices})
-          (.deregisterImage (ec2) (DeregisterImageRequest. image-id))
-          (println "... image" image-id "deregistered")
-          (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id))
-          (println "... snapshot" snapshot-id "deleted")
-          (println "Image deletion complete."))))))
+        (println)
+        (println "The following image will be deregistered, and the associated EBS snapshot deleted.")
+        (report-images :images images :include #{:Devices})
+        (.deregisterImage (ec2) (DeregisterImageRequest. image-id))
+        (println "... image" image-id "deregistered")
+        (doseq [ebsBlockDevice ebsBlockDevices]
+          (let [snapshot-id (.getSnapshotId ebsBlockDevice)]
+            (.deleteSnapshot (ec2) (DeleteSnapshotRequest. snapshot-id))
+            (println "... snapshot" snapshot-id "deleted")))
+        (println "Image deletion complete.")))))
+
+(def delete-ami 
+  "Use delete-image instead.  This stub exists so '(apropos \"ami\")' will return something useful." 
+  "See the 'delete-image' function.")
 
 (defn image-exists?
   "Return true if the specified security image ID exists, false if it does not."
