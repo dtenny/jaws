@@ -25,7 +25,7 @@
             Filter IamInstanceProfileSpecification Instance InstanceAttributeName Image
             LaunchPermissionModifications LaunchPermission
             ModifyImageAttributeRequest ModifyInstanceAttributeRequest
-            Placement RevokeSecurityGroupIngressRequest RunInstancesRequest Snapshot
+            Placement RevokeSecurityGroupIngressRequest RunInstancesRequest SecurityGroup Snapshot
             StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest
             Volume])
   (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
@@ -1645,6 +1645,50 @@
   [instance-id]
   (->> (.getConsoleOutput (ec2) (GetConsoleOutputRequest. instance-id))
        (.getDecodedOutput)))
+
+
+(defmulti  instance-set-security-groups
+  "Assign one or more security groups to an Instance or instance-id.
+  Security groups can be a single SG-id or seq/collection of them.
+
+  This method replaces all previously existing SG settings for the instance
+  with the newly supplied list.
+
+  Returns nil."
+  (fn [i sgs]
+    (class i)))
+(defmethod instance-set-security-groups String [instance-id security-groups]
+  (.modifyInstanceAttribute (ec2)
+    ;; Note: cannot use the constructor with instanceid and GroupSet attribute name
+    ;; and then call 'setGroups', causes 
+    ;; service error for mutually exclusive arguments when I do that.                            
+    (doto (ModifyInstanceAttributeRequest.)
+      (.setInstanceId instance-id)
+      (.setGroups (listify security-groups)))))
+(defmethod instance-set-security-groups Instance [instance security-groups]
+  (instance-set-security-groups (instance-id instance) security-groups))
+
+
+(defmulti  instance-add-security-groups
+  "Add one or more security groups to an Instance or instance-id.
+  Security groups can be a single SG-id or seq/collection of them.
+
+  Note that we have to retrieve existing groups to add to them with this method,
+  the underlying ModifyInstanceAttribute call replaces the security groups entirely.
+
+  If successful (because the new security groups are not already in the existing security groups
+  for the instance), returns the value [#{<old-sg-ids>} #{<new-sg-ids>}], otherwise returns nil."
+  (fn [i sgs]
+    (class i)))
+(defmethod instance-add-security-groups String [instance-id security-groups]
+  (instance-add-security-groups (get-instance instance-id) security-groups))
+(defmethod instance-add-security-groups Instance [instance security-groups]
+  (let [old-groups (into #{} (instance-security-group-ids instance))
+        augmented-groups (into old-groups (listify security-groups))]
+    (if (> (count (clojure.set/difference augmented-groups old-groups)) 0)
+      (do (instance-set-security-groups instance augmented-groups)
+          [old-groups augmented-groups]))))
+
 
 ;;;
 ;;; EC2 Security groups
@@ -1679,6 +1723,41 @@
                                       (.setGroupIds [(name security-group-id)])))))
     (catch AmazonServiceException e nil)))
 
+;;
+;; SecurityGroup attribute retrieval methods return strings unless otherwise noted.
+;;
+
+(defmulti  security-group-description "Return the security group description." class)
+(defmethod security-group-description String [sg-id] (security-group-description (get-security-group sg-id)))
+(defmethod security-group-description SecurityGroup [sg] (.getDescription sg))
+
+(defmulti  security-group-id "Return the security group id." class)
+(defmethod security-group-id String [sg-id] (security-group-id (get-security-group sg-id)))
+(defmethod security-group-id SecurityGroup [sg] (.getGroupId sg))
+
+(defmulti  security-group-name "Return the security group name." class)
+(defmethod security-group-name String [sg-id] (security-group-name (get-security-group sg-id)))
+(defmethod security-group-name SecurityGroup [sg] (.getGroupName sg))
+
+;; TODO: .getIpPermissions, .getIpPermissionsEgress
+
+(defmulti  security-group-owner-id "Return the security group owner AWS account id." class)
+(defmethod security-group-owner-id String [sg-id] (security-group-owner-id (get-security-group sg-id)))
+(defmethod security-group-owner-id SecurityGroup [sg] (.getGroupOwnerId sg))
+
+(defmulti  security-group-tag-map 
+  "Return the tags of an security-group as a Map of tag names as strings and tag values as strings.
+  Caveat: if there are multiple tags with the same tag name, the map value for the tag name
+  will be a vector of (possibly duplicate) tag values for the name."
+  class)
+(defmethod security-group-tag-map String [sg-id] (security-group-tag-map (get-security-group sg-id)))
+(defmethod security-group-tag-map SecurityGroup  [sg] (tag-list->map-safe (.getTags sg)))
+
+(defmulti  security-group-vpc-id "Return the security group vpc-id." class)
+(defmethod security-group-vpc-id String [sg-id] (security-group-vpc-id (get-security-group sg-id)))
+(defmethod security-group-vpc-id SecurityGroup [sg] (.getGroupVpcId sg))
+
+
 (defn security-group-exists? 
   "Return true if the specified security group ID exists, false otherwise."
   [sg-id]
@@ -1697,7 +1776,7 @@
                     (.getDescription sg))))
 
 (defn describe-security-groups
-  "Return a sequence of Security Groups.
+  "Return a sequence of SecurityGroup objects.
    If no options are specified, returns a list of all security groups.
 
    Options:
