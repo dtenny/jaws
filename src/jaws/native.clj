@@ -876,11 +876,12 @@
 (defmethod instance-sriov-net-support Instance  [instance] (.getSriovNetSupport instance))
 
 (defmulti  instance-state
-    "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
-     Note that an instance-id will cause a refetch of state, while an Instance
-     object merely decodes the state already in memory (which will not change
-     across successfive calls)."
-    class)
+  "Retrieve instance state for an EC2 instance as a keyword, e.g. :running.
+  Note that an instance-id will cause a refetch of state, while an Instance
+  object merely decodes the state already in memory (which will not change
+  across successful calls).  Refer to 'instance-state-code-map' for details
+  on possible instance states."
+  class)
 (defmethod instance-state String [instance-id]
   (instance-state (get-instance instance-id)))
 (defmethod instance-state Instance [instance]
