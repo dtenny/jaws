@@ -1739,7 +1739,32 @@
 (defmethod security-group-name String [sg-id] (security-group-name (get-security-group sg-id)))
 (defmethod security-group-name SecurityGroup [sg] (.getGroupName sg))
 
-;; TODO: .getIpPermissions, .getIpPermissionsEgress
+(defmulti  security-group-inbound-ip-permissions 
+  "Return the security group inbound-ip-permissions as a sequnce of maps.
+  All returned sequence element values are fully realized.
+
+  Each map describes one 'rule'.
+  Possible map keys and meanings include:
+
+    :from-port    - the start of port range for the TCP and UDP protocols, or an ICMP type number.
+                    A value of -1 indicates all ICMP types.  The :from-port value is an Integer.
+    :ip-protocol  - a string, one of 'tcp', 'udp', or 'icmp', or an IANA protocol number as a string.
+                    See http://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+                    for protocol number meanings.
+    :ip-ranges    - a sequence of strings (CIDRs, other?) describing port ranges.
+    :prefix-list-ids - a possibly empty sequence of one or more prefix list ids for an AWS service."
+  class)
+(defmethod security-group-inbound-ip-permissions String [sg-id] 
+  (security-group-inbound-ip-permissions (get-security-group sg-id)))
+(defmethod security-group-inbound-ip-permissions SecurityGroup [sg] 
+  (doall 
+   (for [ip-permission (.getIpPermissions sg)]
+     {:from-port (.getFromPort ip-permission)
+      :ip-protocol (.getIpProtocol ip-permission)
+      :ip-ranges (.getIpRanges ip-permission)
+      :prefix-list-ids (.getPrefixListIds ip-permission)})))
+      
+;; TODO: .getIpPermissionsEgress
 
 (defmulti  security-group-owner-id "Return the security group owner AWS account id." class)
 (defmethod security-group-owner-id String [sg-id] (security-group-owner-id (get-security-group sg-id)))
