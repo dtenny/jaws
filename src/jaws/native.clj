@@ -1,9 +1,8 @@
 (ns jaws.native
-  (:use clojure.repl)
   (:use clojure.set)
-  (:use [jdt core cl shell])
-  (:use [jdt.easyfs :exclude [copy]])
-  (:use [clojure.java.io])
+  (:use jdt.core)
+  (:use [jdt.easyfs :as easyfs :exclude [copy]])
+  (:use [clojure.java.io :as io])
   (:use [clojure.pprint :only [cl-format]])
   (:import [com.amazonaws AmazonServiceException])
   (:import [com.amazonaws.auth BasicAWSCredentials InstanceProfileCredentialsProvider])
@@ -26,7 +25,7 @@
             LaunchPermissionModifications LaunchPermission
             ModifyImageAttributeRequest ModifyInstanceAttributeRequest
             Placement RevokeSecurityGroupIngressRequest RunInstancesRequest SecurityGroup Snapshot
-            StartInstancesRequest StopInstancesRequest Tag TerminateInstancesRequest
+            StartInstancesRequest StopInstancesRequest Subnet Tag TerminateInstancesRequest
             Volume])
   (:import [com.amazonaws.services.elasticloadbalancing AmazonElasticLoadBalancingClient])
   (:import [com.amazonaws.services.elasticloadbalancing.model DescribeLoadBalancersRequest])
@@ -35,6 +34,8 @@
             GetInstanceProfileRequest GetRolePolicyRequest GetRoleRequest
             ListRolePoliciesRequest])
   (:import java.io.File))
+
+;;(:use clojure.repl) - for debugging
 
 (load "creds")
 
@@ -1847,6 +1848,118 @@
        (.setToPort (int to-port)))))
 
 
+
+;;;
+;;; EC2 Subnets
+;;;
+
+(defn get-subnet
+  "Retrieve Subnet given subnet-id, or nil if the subnet doesn't exist.
+  ID may be a string or keyword."
+  [subnet-id]
+  ;; AmazonServiceException 400 if the entity doesn't exist.
+  (try
+    (first (.getSubnets
+            (.describeSubnets (ec2) (doto (DescribeSubnetsRequest.)
+                                        (.setSubnetIds [(name subnet-id)])))))
+    (catch AmazonServiceException e nil)))
+  
+(defmulti  subnet-id "Return the subnet id." class)
+(defmethod subnet-id String [subnet-id] subnet-id)
+(defmethod subnet-id Subnet [subnet] (.getSubnetId subnet))
+
+(defmulti  subnet-cidr-block "Return the subnet CIDR block." class)
+(defmethod subnet-cidr-block String [subnet-id] (subnet-cidr-block (get-subnet subnet-id)))
+(defmethod subnet-cidr-block Subnet [subnet] (.getCidrBlock subnet))
+
+(defmulti  subnet-is-default? "Return true if the subnet is the default subnet for the AZ." class)
+(defmethod subnet-is-default? String [subnet-id] (subnet-is-default? (get-subnet subnet-id)))
+(defmethod subnet-is-default? Subnet [subnet] (.getDefaultForAz subnet))
+
+(defmulti  subnet-state "Return the subnet state (pending|available)." class)
+(defmethod subnet-state String [subnet-id] (subnet-state (get-subnet subnet-id)))
+(defmethod subnet-state Subnet [subnet] (.getState subnet))
+
+(defmulti  subnet-available-ip-address-count "Return the subnet available address count." class)
+(defmethod subnet-available-ip-address-count String [subnet-id] (subnet-available-ip-address-count (get-subnet subnet-id)))
+(defmethod subnet-available-ip-address-count Subnet [subnet] (.getAvailableIpAddressCount subnet))
+
+(defmulti  subnet-map-public-ip-on-launch?
+  "Return true if the instances launched in this subnet receive a public IP address." class)
+(defmethod subnet-map-public-ip-on-launch? String [subnet-id]
+  (subnet-map-public-ip-on-launch? (get-subnet subnet-id)))
+(defmethod subnet-map-public-ip-on-launch? Subnet [subnet] (.getMapPublicIpOnLaunch subnet))
+
+(defmulti  subnet-tag-map 
+  "Return the tags of an subnet as a Map of tag names as strings and tag values as strings.
+  Caveat: if there are multiple tags with the same tag name, the map value for the tag name
+  will be a vector of (possibly duplicate) tag values for the name."
+  class)
+(defmethod subnet-tag-map String [subnet-id] (subnet-tag-map (get-subnet subnet-id)))
+(defmethod subnet-tag-map Subnet [subnet] (tag-list->map-safe (.getTags subnet)))
+
+;; *TODO*: [org.apache.commons.net.util SubnetUtils] provides some excellent augmentation of 
+;; subnet information we should probably encapsulate here.
+
+(defn describe-subnets
+ "Return a list of Subnet objects.
+  Options:
+    :ids - a subnet id or sequence of subnet ids, if unspecified all subnets will be listed.
+    :filters - map of attributes/values to filter on.  Key (k/v can be keyword, string, or other for vals).
+      availability-zone  - avilability zone for the subnet.
+      cidr | cidr-block - The CIDR block of the subnet. 
+             The cidr block you specify must exactly match the subnet's
+             cidr block for information to be returned for the subnet. (cidr-block is alias)
+      default-for-az - Indicates whether this is the default subnet for the Availability Zone
+      state - The state of the subnet (pending | available).
+      tag:key=value - The key/value combination of a tag assigned to the resource.
+      tag-key - The key of a tag assigned to the resource. 
+      tag-value - The value of a tag assigned to the resource.
+      vpc-id - the ID of the vpc for the subnet."
+ [& {:keys [ids filters]}]
+ (let [request (DescribeSubnetsRequest.)]
+   (if ids (.setSubnetIds request (listify ids)))
+   (if filters (.setFilters request (map->ec2-filters filters)))
+   (seq (.getSubnets (.describeSubnets (ec2) request)))))
+
+(defn report-subnets
+  "Report on zero or more Subnet instances,
+  fetch them if none are specified as with 'describe-subnets'.
+
+  Options: 
+   :subnets - a Subnet object, or collection of Subnet objects.
+   :ids - a subnet id, or collection of subnet ids.
+   :fields - set of fields to display in addition to the subnet id.
+             Defaults to #{:AvailabilityZone :CidrBlock :IsDefault :State :Tags}.
+             Additional fields include: :AvailableIpAddressCount :MapPublicIpOnLaunch.
+   :include - Set of additional fields to display, defaults to #{}.
+   :exclude - Set of additional fields to exclude from the display, defauls to #{}.
+   :indent indent printed lines with the indicated (minimum) number of leading spaces
+           indentation desired (default *indent*).  note that secondary lines (if
+           more than one line per instance is printed) are indented an
+           additional indent-incr spaces.
+   :indent-incr amount to additionally indent secondary data lines (for
+                options where more than one line per instance is printed. Default 2.
+
+  Returns nil."
+  [& {:keys [subnets ids fields include exclude indent indent-incr]
+      :or {fields #{:AvailabilityZone :CidrBlock :IsDefault :State :Tags} include #{} exclude #{}
+           indent *indent* indent-incr 2}}]
+  {:pre [(set? include) (set? exclude) (set? fields)]}
+  (let [fetched-subnets (if (or (not subnets) ids) (describe-subnets :ids ids))
+        subnets (concat (listify subnets) fetched-subnets)
+        fields (difference (union fields include) exclude)]
+    (doseq [subnet subnets]
+      (do-indent indent)
+      (pu (.getSubnetId subnet))
+      (pif (:CidrBlock fields) (.getCidrBlock subnet) pu)
+      (pif (:IsDefault fields) (.getDefaultForAz subnet) pu)
+      (pif (:State fields) (.getState subnet) pu)
+      (pif (:AvailableIpAddressCount fields) (.getAvailableIpAddressCount subnet) pu)
+      (pif (:MapPublicIpOnLaunch fields) (.getMapPublicIpOnLaunch subnet) pu)
+      (pif (:Tags fields) (squish-tags (.getTags subnet)) pq)
+      (println))))
+
 ;;;
 ;;; EC2 VPC
 ;;;
@@ -1889,7 +2002,7 @@
 
 (defn report-vpcs
   "Report on zero or more Vpc instances,
-  fetch them if non arespecified as with 'describe-vpcs'.
+  fetch them if none are specified as with 'describe-vpcs'.
 
   Options: 
    :vpcs - a Vpc object, or collection of Vpc objects.

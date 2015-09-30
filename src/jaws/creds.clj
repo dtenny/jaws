@@ -41,7 +41,7 @@
 (defn parse-cred
   "Return [access-key secret-key] or throw an exception if no credentials were found in the file."
   [f]
-  (let [file-lines (readlines (as-file f))
+  (let [file-lines (readlines (io/as-file f))
         matchmap (select-matching-strings file-lines 
                                           {:key ACCESS_KEY_PATTERN :secret SECRET_KEY_PATTERN} re-find)
         keylines (:key matchmap)
@@ -155,10 +155,10 @@
   
    Returns the handle used for the credentials added to cred-map."
   [file-spec handle]
-  (let [path (to-path file-spec)]
+  (let [path (easyfs/to-path file-spec)]
     (unless (exists? path)
       (throw (IllegalArgumentException. (str "No such file: " file-spec))))
-    (let [file (to-file path)
+    (let [file (easyfs/to-file path)
           handle (or handle file)
           [access-key key-secret] (parse-cred file)
           cred-info (map->CredentialInfo
@@ -179,7 +179,7 @@
   [file-specs handle-fn]
   {:pre [(or (nil? handle-fn) (fn? handle-fn))]}
   (let [handle-fn (or handle-fn identity)
-        files (map (fn [f] (to-file (to-path f))) file-specs)]
+        files (map (fn [f] (easyfs/to-file (easyfs/to-path f))) file-specs)]
     (doseq [file files]
       (add-cred-file file (handle-fn file)))))
 
